@@ -18,11 +18,11 @@
 #include <cstdint>
 #include <sstream>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include "absl/strings/escaping.h"
 #include "absl/strings/str_split.h"
+#include "ray/common/monitors/cpu_monitor_utils.h"
 #include "ray/util/logging.h"
 
 template <typename T>
@@ -50,9 +50,9 @@ inline bool ConvertValue<bool>(const std::string &type_string, const std::string
 template <>
 inline std::vector<std::string> ConvertValue<std::vector<std::string>>(
     const std::string &type_string, const std::string &value) {
-  std::vector<std::string> split = absl::StrSplit(value, ",");
-  for (auto &value : split) {
-    boost::algorithm::trim(value);
+  std::vector<std::string> split = absl::StrSplit(value, ',');
+  for (auto &part : split) {
+    boost::algorithm::trim(part);
   }
   return split;
 }
@@ -98,7 +98,9 @@ class RayConfig {
   RayConfig();
 
   template <typename T>
-  T ReadEnv(const std::string &name, const std::string &type_string, T default_value) {
+  T ReadEnv(const std::string &name,
+            const std::string &type_string,
+            const T &default_value) {
     auto value = std::getenv(name.c_str());
     if (value == nullptr) {
       return default_value;

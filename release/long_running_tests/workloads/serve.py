@@ -1,3 +1,4 @@
+import os
 import re
 import time
 import subprocess
@@ -16,8 +17,6 @@ NUM_REPLICAS = 7
 MAX_BATCH_SIZE = 16
 
 # Cluster setup constants
-NUM_REDIS_SHARDS = 1
-REDIS_MAX_MEMORY = 10**8
 OBJECT_STORE_MEMORY = 10**8
 NUM_NODES = 4
 
@@ -42,13 +41,11 @@ cluster = Cluster()
 for i in range(NUM_NODES):
     cluster.add_node(
         redis_port=6379 if i == 0 else None,
-        num_redis_shards=NUM_REDIS_SHARDS if i == 0 else None,
         dashboard_agent_listen_port=(52365 + i),
         num_cpus=8,
         num_gpus=0,
         resources={str(i): 2},
         object_store_memory=OBJECT_STORE_MEMORY,
-        redis_max_memory=REDIS_MAX_MEMORY,
         dashboard_host="0.0.0.0",
     )
 
@@ -79,6 +76,10 @@ print("Started load testing with the following config: ")
 print(f"num_connections: {NUM_CONNECTIONS}")
 print(f"num_threads: {NUM_THREADS}")
 print(f"time_per_cycle: {TIME_PER_CYCLE}")
+
+# Stop before the 24h job timeout so the test exits cleanly as success.
+MAX_RUNTIME_S = int(os.environ.get("MAX_RUNTIME_S", 22 * 60 * 60))
+start_time = time.time()
 
 while True:
     proc = subprocess.Popen(
@@ -138,3 +139,6 @@ while True:
     print(err.decode())
 
     update_progress(metrics_dict)
+    if time.time() - start_time > MAX_RUNTIME_S:
+        print(f"Reached max runtime of {MAX_RUNTIME_S}s. Exiting successfully.")
+        break

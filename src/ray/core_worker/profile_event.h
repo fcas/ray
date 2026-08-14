@@ -14,8 +14,12 @@
 
 #pragma once
 
+#include <memory>
+#include <string>
+
 #include "ray/core_worker/context.h"
 #include "ray/core_worker/task_event_buffer.h"
+#include "ray/util/clock.h"
 
 namespace ray {
 namespace core {
@@ -29,9 +33,14 @@ namespace worker {
 class ProfileEvent {
  public:
   ProfileEvent(TaskEventBuffer &task_event_buffer,
+               ray::observability::RayEventRecorderInterface &ray_task_event_recorder,
                WorkerContext &worker_context,
                const std::string &node_ip_address,
-               const std::string &event_type);
+               const std::string &event_type,
+               ClockInterface &clock);
+
+  ProfileEvent(const ProfileEvent &) = delete;
+  ProfileEvent &operator=(const ProfileEvent &) = delete;
 
   // Set the end time for the event and add it to the profiler.
   ~ProfileEvent();
@@ -42,6 +51,12 @@ class ProfileEvent {
  private:
   // Reference to the TaskEventBuffer.
   TaskEventBuffer &task_event_buffer_;
+
+  // Records the profile event to the event aggregator (parallel to the TaskEventBuffer).
+  ray::observability::RayEventRecorderInterface &ray_task_event_recorder_;
+
+  // Clock used to timestamp the start and end of the event.
+  ClockInterface &clock_;
 
   // The underlying event.
   std::unique_ptr<TaskProfileEvent> event_ = nullptr;

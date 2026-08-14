@@ -16,15 +16,39 @@
 
 #include <fstream>
 #include <regex>
+#include <string>
+#include <utility>
 
+#include "absl/strings/internal/resize_uninitialized.h"
 #include "ray/util/logging.h"
 
 namespace ray {
 namespace {
 const size_t UINT64_size = sizeof(uint64_t);
-}
 
-/* static */ absl::optional<SpilledObjectReader>
+bool AppendFileSection(const std::string &path,
+                       uint64_t offset,
+                       uint64_t size,
+                       std::string &output) {
+  std::ifstream file(path, std::ios::binary);
+  file.seekg(static_cast<std::streamoff>(offset));
+  const size_t old_size = output.size();
+  // Grow `output` without value-initializing the new bytes (file.read overwrites
+  // them); std::string::resize would needlessly zero-fill first.
+  absl::strings_internal::STLStringResizeUninitialized(&output, old_size + size);
+  file.read(&output[old_size], static_cast<std::streamsize>(size));
+
+  uint64_t bytes_read = static_cast<uint64_t>(file.gcount());
+  // Shrink the string back to its original state to drop uninitialized garbage
+  if (bytes_read != size) {
+    output.resize(old_size);
+    return false;
+  }
+  return true;
+}
+}  // namespace
+
+/* static */ std::optional<SpilledObjectReader>
 SpilledObjectReader::CreateSpilledObjectReader(const std::string &object_url) {
   std::string file_path;
   uint64_t object_offset = 0;
@@ -33,7 +57,7 @@ SpilledObjectReader::CreateSpilledObjectReader(const std::string &object_url) {
   if (!SpilledObjectReader::ParseObjectURL(
           object_url, file_path, object_offset, object_size)) {
     RAY_LOG(WARNING) << "Failed to parse spilled object url: " << object_url;
-    return absl::optional<SpilledObjectReader>();
+    return std::optional<SpilledObjectReader>();
   }
 
   uint64_t data_offset = 0;
@@ -51,10 +75,10 @@ SpilledObjectReader::CreateSpilledObjectReader(const std::string &object_url) {
                                                      metadata_size,
                                                      owner_address)) {
     RAY_LOG(WARNING) << "Failed to parse object header for spilled object " << object_url;
-    return absl::optional<SpilledObjectReader>();
+    return std::optional<SpilledObjectReader>();
   }
 
-  return absl::optional<SpilledObjectReader>(
+  return std::optional<SpilledObjectReader>(
       SpilledObjectReader(std::move(file_path),
                           object_size,
                           data_offset,
@@ -168,15 +192,13 @@ uint64_t SpilledObjectReader::ToUINT64(const std::string &s) {
 
 bool SpilledObjectReader::ReadFromDataSection(uint64_t offset,
                                               uint64_t size,
-                                              char *output) const {
-  std::ifstream is(file_path_, std::ios::binary);
-  return is.seekg(data_offset_ + offset) && is.read(output, size);
+                                              std::string &output) const {
+  return AppendFileSection(file_path_, data_offset_ + offset, size, output);
 }
 
 bool SpilledObjectReader::ReadFromMetadataSection(uint64_t offset,
                                                   uint64_t size,
-                                                  char *output) const {
-  std::ifstream is(file_path_, std::ios::binary);
-  return is.seekg(metadata_offset_ + offset) && is.read(output, size);
+                                                  std::string &output) const {
+  return AppendFileSection(file_path_, metadata_offset_ + offset, size, output);
 }
 }  // namespace ray

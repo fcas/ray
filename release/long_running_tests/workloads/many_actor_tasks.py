@@ -1,4 +1,5 @@
 # This workload tests submitting many actor methods.
+import os
 import time
 
 import numpy as np
@@ -13,8 +14,6 @@ def update_progress(result):
     safe_write_to_results_json(result)
 
 
-num_redis_shards = 5
-redis_max_memory = 10**8
 object_store_memory = 10**8
 num_nodes = 10
 
@@ -23,8 +22,7 @@ message = (
     "workload. We divide the system memory by 2 to provide a buffer."
 )
 assert (
-    num_nodes * object_store_memory + num_redis_shards * redis_max_memory
-    < ray._private.utils.get_system_memory() / 2
+    num_nodes * object_store_memory < ray._common.utils.get_system_memory() / 2
 ), message
 
 # Simulate a cluster on one machine.
@@ -33,12 +31,10 @@ cluster = Cluster()
 for i in range(num_nodes):
     cluster.add_node(
         redis_port=6379 if i == 0 else None,
-        num_redis_shards=num_redis_shards if i == 0 else None,
         num_cpus=5,
         num_gpus=0,
         resources={str(i): 2},
         object_store_memory=object_store_memory,
-        redis_max_memory=redis_max_memory,
         dashboard_host="0.0.0.0",
     )
 ray.init(address=cluster.address)
@@ -60,6 +56,9 @@ actors = [
     Actor._remote([], {}, num_cpus=0.1, resources={str(i % num_nodes): 0.1})
     for i in range(num_nodes * 5)
 ]
+
+# Stop before the 24h job timeout so the test exits cleanly as success.
+MAX_RUNTIME_S = int(os.environ.get("MAX_RUNTIME_S", 22 * 60 * 60))
 
 iteration = 0
 start_time = time.time()
@@ -89,3 +88,6 @@ while True:
     )
     previous_time = new_time
     iteration += 1
+    if new_time - start_time > MAX_RUNTIME_S:
+        print(f"Reached max runtime of {MAX_RUNTIME_S}s. Exiting successfully.")
+        break

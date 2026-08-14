@@ -1,5 +1,8 @@
 ---
 orphan: true
+myst:
+  html_meta:
+    description: "Train models with TensorFlow, PyTorch, or scikit-learn and deploy each of them to Ray Serve."
 ---
 
 (serve-ml-models-tutorial)=
@@ -15,17 +18,15 @@ See the [Key Concepts](serve-key-concepts) to learn more general information abo
 
 ::::{tab-item} Keras and TensorFlow
 
-This example trains and deploys a simple TensorFlow neural net.
-In particular, it shows:
+This example trains and deploys a simple TensorFlow neural net. In particular, it shows:
 
 - How to train a TensorFlow model and load the model from your file system in your Ray Serve deployment.
 - How to parse the JSON request and make a prediction.
 
-Ray Serve is framework-agnostic--you can use any version of TensorFlow.
-This tutorial uses TensorFlow 2 and Keras. You also need `requests` to send HTTP requests to your model deployment. If you haven't already, install TensorFlow 2 and requests by running:
+Ray Serve is framework-agnostic--you can use any version of TensorFlow. This tutorial uses TensorFlow 2 and Keras. You also need `requests` to send HTTP requests to your model deployment. If you haven't already, install TensorFlow 2 and requests by running:
 
 ```console
-$ pip install "tensorflow>=2.0" requests
+$ pip install "tensorflow>=2.0" requests "ray[serve]"
 ```
 
 Open a new Python file called `tutorial_tensorflow.py`. First, import Ray Serve and some other helpers.
@@ -94,8 +95,7 @@ You should get an output like the following, although the exact prediction may v
 
 ::::{tab-item} PyTorch
 
-This example loads and deploys a PyTorch ResNet model.
-In particular, it shows:
+This example loads and deploys a PyTorch ResNet model. In particular, it shows:
 
 - How to load the model from PyTorch's pre-trained Model Zoo.
 - How to parse the JSON request, transform the payload and make a prediction.
@@ -103,7 +103,7 @@ In particular, it shows:
 This tutorial requires PyTorch and Torchvision. Ray Serve is framework agnostic and works with any version of PyTorch. You also need `requests` to send HTTP requests to your model deployment. If you haven't already, install them by running:
 
 ```console
-$ pip install torch torchvision requests
+$ pip install torch torchvision requests  "ray[serve]"
 ```
 
 Open a new Python file called `tutorial_pytorch.py`. First, import Ray Serve and some other helpers.
@@ -163,8 +163,7 @@ You should get an output like the following, although the exact number may vary:
 
 ::::{tab-item} Scikit-learn
 
-This example trains and deploys a simple scikit-learn classifier.
-In particular, it shows:
+This example trains and deploys a simple scikit-learn classifier. In particular, it shows:
 
 - How to load the scikit-learn model from file system in your Ray Serve definition.
 - How to parse the JSON request and make a prediction.
@@ -172,7 +171,7 @@ In particular, it shows:
 Ray Serve is framework-agnostic. You can use any version of sklearn. You also need `requests` to send HTTP requests to your model deployment. If you haven't already, install scikit-learn and requests by running:
 
 ```console
-$ pip install scikit-learn requests
+$ pip install scikit-learn requests "ray[serve]"
 ```
 
 Open a new Python file called `tutorial_sklearn.py`. Import Ray Serve and some other helpers.

@@ -1,13 +1,14 @@
-import subprocess
-import os
-import sys
-import random
-import threading
 import collections
 import logging
+import os
+import random
 import shutil
+import subprocess
+import sys
+import threading
 import time
 
+from ray._common.network_utils import is_ipv6
 
 _logger = logging.getLogger("ray.util.spark.utils")
 
@@ -100,7 +101,11 @@ def is_port_in_use(host, port):
     import socket
     from contextlib import closing
 
-    with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
+    with closing(
+        socket.socket(
+            socket.AF_INET6 if is_ipv6(host) else socket.AF_INET, socket.SOCK_STREAM
+        )
+    ) as sock:
         return sock.connect_ex((host, port)) == 0
 
 
@@ -199,8 +204,9 @@ _RAY_ON_SPARK_NODE_MEMORY_BUFFER_OFFSET = 0.8
 
 
 def calc_mem_ray_head_node(configured_heap_memory_bytes, configured_object_store_bytes):
-    import psutil
     import shutil
+
+    import psutil
 
     if RAY_ON_SPARK_DRIVER_PHYSICAL_MEMORY_BYTES in os.environ:
         available_physical_mem = int(
@@ -293,13 +299,22 @@ def _calc_mem_per_ray_node(
         )
 
     if object_store_bytes < OBJECT_STORE_MINIMUM_MEMORY_BYTES:
+        if object_store_bytes == available_shared_mem_per_node:
+            warning_msg = (
+                "Your operating system is configured with too small /dev/shm "
+                "size, so `object_store_memory_worker_node` value is configured "
+                f"to minimal size ({OBJECT_STORE_MINIMUM_MEMORY_BYTES} bytes),"
+                f"Please increase system /dev/shm size."
+            )
+        else:
+            warning_msg = (
+                "You configured too small Ray node object store memory size, "
+                "so `object_store_memory_worker_node` value is configured "
+                f"to minimal size ({OBJECT_STORE_MINIMUM_MEMORY_BYTES} bytes),"
+                "Please increase 'object_store_memory_worker_node' argument value."
+            )
+
         object_store_bytes = OBJECT_STORE_MINIMUM_MEMORY_BYTES
-        warning_msg = (
-            "Your operating system is configured with too small /dev/shm "
-            "size, so `object_store_memory_per_node` value is configured "
-            f"to minimal size ({OBJECT_STORE_MINIMUM_MEMORY_BYTES} bytes),"
-            f"Please increase system /dev/shm size."
-        )
 
     object_store_bytes = int(object_store_bytes)
 

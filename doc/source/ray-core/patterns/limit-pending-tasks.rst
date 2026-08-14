@@ -1,3 +1,6 @@
+.. meta::
+   :description: Pattern: use ray.wait to bound the number of in-flight tasks so the submission loop doesn't outrun the cluster.
+
 .. _core-patterns-limit-pending-tasks:
 
 Pattern: Using ray.wait to limit the number of pending tasks
@@ -22,7 +25,7 @@ With ``ray.wait()``, we can apply backpressure and limit the number of pending t
 Example use case
 ----------------
 
-You have a worker actor that process tasks at a rate of X tasks per second and you want to submit tasks to it at a rate lower than X to avoid OOM.
+You have a worker actor that processes tasks at a rate of X tasks per second and you want to submit tasks to it at a rate lower than X to avoid OOM.
 
 For example, Ray Serve uses this pattern to limit the number of pending queries for each worker.
 

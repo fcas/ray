@@ -1,3 +1,8 @@
+.. meta::
+   :description: Start the Ray runtime on one machine with ray.init, from the CLI with ray start, or launch a multi-node cluster with ray up.
+
+.. _start-ray:
+
 Starting Ray
 ============
 
@@ -75,6 +80,13 @@ Calling ``ray.init()`` starts a local Ray instance on your laptop/machine. This 
             ray::Init()
 
 When the process calling ``ray.init()`` terminates, the Ray runtime will also terminate. To explicitly stop or restart Ray, use the shutdown API.
+
+.. note::
+
+  The behavior of ``ray.shutdown()`` depends on how the cluster was initialized:
+
+  * If ``ray.init()`` started a new local cluster, ``ray.shutdown()`` will terminate all the local Ray processes.
+  * If you connected to an existing cluster (e.g., via ``ray.init(address="auto")`` or ``ray.init(address="ray://<ip>:<port>")``), ``ray.shutdown()`` only disconnects the client -- it does **not** shut down the remote cluster.
 
 .. tab-set::
 
@@ -260,4 +272,4 @@ Note that the machine calling ``ray up`` will not be considered as part of the R
 What's next?
 ------------
 
-Check out our `Deployment section <cluster/index.html>`_ for more information on deploying Ray in different settings, including Kubernetes, YARN, and SLURM.
+Check out our `Deployment section <../cluster/getting-started.html>`_ for more information on deploying Ray in different settings, including `Kubernetes <../cluster/kubernetes/index.html>`_, `YARN <../cluster/vms/user-guides/community/yarn.html>`_, and `SLURM <../cluster/vms/user-guides/community/slurm.html>`_.

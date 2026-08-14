@@ -1,3 +1,6 @@
+.. meta::
+   :description: Object fault tolerance in Ray: lineage-based recovery from data loss, recovery from owner failure, and understanding ObjectLostError.
+
 .. _fault-tolerance-objects:
 .. _object-fault-tolerance:
 
@@ -73,8 +76,8 @@ will clean up any remaining copies of the object's value to prevent a memory
 leak. Any workers that subsequently try to get the object's value will receive
 an ``OwnerDiedError`` exception, which can be handled manually.
 
-Understanding `ObjectLostErrors`
---------------------------------
+Understanding ``ObjectLostErrors``
+----------------------------------
 
 Ray throws an ``ObjectLostError`` to the application when an object cannot be
 retrieved due to application or system error. This can occur during a

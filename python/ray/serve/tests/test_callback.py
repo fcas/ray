@@ -2,20 +2,26 @@ import importlib
 import logging
 import os
 import sys
+from typing import Any, Dict, Generator
 
+import httpx
 import pytest
-import requests
 import starlette
 from starlette.middleware import Middleware
 
 import ray
 from ray import serve
-from ray._private.test_utils import wait_for_condition
+from ray._common.test_utils import wait_for_condition
 from ray.exceptions import RayActorError
-from ray.serve._private.common import ProxyStatus
+from ray.serve._private.test_utils import get_application_url, skip_if_haproxy
 from ray.serve._private.utils import call_function_from_import_path
+from ray.serve.config import HTTPOptions, gRPCOptions
 from ray.serve.context import _get_global_client
-from ray.serve.schema import LoggingConfig, ServeInstanceDetails
+from ray.serve.schema import (
+    LoggingConfig,
+    ProxyStatus,
+    ServeInstanceDetails,
+)
 
 
 # ==== Callbacks used in this test ====
@@ -62,12 +68,17 @@ NOT_CALLABLE_OBJECT = 1
 
 
 @pytest.fixture()
-def ray_instance(request):
+def ray_instance(
+    request: pytest.FixtureRequest,
+) -> Generator[Dict[str, Any], None, None]:
     """Starts and stops a Ray instance for this test.
 
     Args:
         request: request.param should contain a dictionary of env vars and
             their values. The Ray instance will be started with these env vars.
+
+    Yields:
+        Dict[str, Any]: The dict returned by ``ray.init`` for the started cluster.
     """
 
     original_env_vars = os.environ.copy()
@@ -85,7 +96,10 @@ def ray_instance(request):
     yield ray.init()
 
     serve.shutdown()
-    ray.shutdown()
+    # wait_for_processes=True blocks until the raylet/GCS/etc. subprocesses
+    # have fully exited. Without it, this teardown races the next test's
+    # ray.init() and the new raylet can fail to register the driver.
+    ray.shutdown(wait_for_processes=True)
 
     os.environ.clear()
     os.environ.update(original_env_vars)
@@ -124,6 +138,12 @@ def test_call_function_from_import_path():
 )
 def test_callback(ray_instance, capsys):
     """Test callback function works in http proxy and controller"""
+    serve.start(
+        http_options=HTTPOptions(
+            host="0.0.0.0",
+            request_timeout_s=500,
+        ),
+    )
 
     @serve.deployment
     class Model:
@@ -135,9 +155,10 @@ def test_callback(ray_instance, capsys):
             return "Not found custom headers"
 
     serve.run(Model.bind())
-    resp = requests.get("http://localhost:8000/")
-    assert resp.text == "custom_header_value"
+    url = get_application_url()
+    resp = httpx.get(url)
 
+    assert resp.text == "custom_header_value"
     captured = capsys.readouterr()
     assert "MyCustom message: hello" in captured.err
 
@@ -160,9 +181,8 @@ def test_callback_fail(ray_instance):
 
     actor_def = ray.serve._private.proxy.ProxyActor
     handle = actor_def.remote(
-        host="http_proxy",
-        port=123,
-        root_path="/",
+        http_options=HTTPOptions(host="http_proxy", root_path="/", port=123),
+        grpc_options=gRPCOptions(),
         node_ip_address="127.0.0.1",
         node_id="123",
         logging_config=LoggingConfig(),
@@ -171,9 +191,11 @@ def test_callback_fail(ray_instance):
     with pytest.raises(RayActorError, match="this is from raise_error_callback"):
         ray.get(handle.ready.remote())
 
-    actor_def = ray.serve._private.controller.ServeController
+    serve_controller = ray.serve._private.controller.ServeController
+    actor_def = ray.actor._make_actor(serve_controller, {})
     handle = actor_def.remote(
-        http_config={},
+        http_options=HTTPOptions(),
+        grpc_options=gRPCOptions(),
         global_logging_config=LoggingConfig(),
     )
     with pytest.raises(RayActorError, match="cannot be imported"):
@@ -194,9 +216,8 @@ def test_http_proxy_return_aribitary_objects(ray_instance):
 
     actor_def = ray.serve._private.proxy.ProxyActor
     handle = actor_def.remote(
-        host="http_proxy",
-        port=123,
-        root_path="/",
+        http_options=HTTPOptions(host="http_proxy", root_path="/", port=123),
+        grpc_options=gRPCOptions(),
         node_ip_address="127.0.0.1",
         node_id="123",
         logging_config=LoggingConfig(),
@@ -217,7 +238,12 @@ def test_http_proxy_return_aribitary_objects(ray_instance):
     ],
     indirect=True,
 )
-def test_http_proxy_calllback_failures(ray_instance, capsys):
+@skip_if_haproxy(
+    "under direct ingress the http_proxy_callback middleware runs on the replica "
+    "HTTP server, not a native proxy, so a failing callback restarts the replica "
+    "and this test's assertion that the proxy keeps restarting no longer applies"
+)
+def test_http_proxy_callback_failures(ray_instance, capsys):
     """Test http proxy keeps restarting when callback function fails"""
 
     try:

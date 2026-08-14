@@ -1,3 +1,6 @@
+.. meta::
+   :description: Read, transform, run inference on, and save large text datasets with Ray Data.
+
 Working with Text
 =================
 
@@ -23,7 +26,7 @@ files and manually decode data.
     .. tab-item:: Text lines
 
         To read lines of text, call :func:`~ray.data.read_text`. Ray Data creates a
-        row for each line of text.
+        row for each line of text. In the schema, the column name defaults to "text". 
 
         .. testcode::
 
@@ -156,7 +159,7 @@ that sets up and invokes a model. Then, call
 
     ds = (
         ray.data.read_text("s3://anonymous@ray-example-data/this.txt")
-        .map_batches(TextClassifier, concurrency=2)
+        .map_batches(TextClassifier, compute=ray.data.ActorPoolStrategy(size=2), batch_size="auto")
     )
 
     ds.show(3)
@@ -166,6 +169,8 @@ that sets up and invokes a model. Then, call
     {'text': 'The Zen of Python, by Tim Peters', 'label': 'POSITIVE'}
     {'text': 'Beautiful is better than ugly.', 'label': 'POSITIVE'}
     {'text': 'Explicit is better than implicit.', 'label': 'POSITIVE'}
+
+For more information on handling large language models, see :ref:`Working with LLMs <working-with-llms>`.
 
 For more information on performing inference, see
 :ref:`End-to-end: Offline Batch Inference <batch_inference_home>`
@@ -180,14 +185,15 @@ To save text, call a method like :meth:`~ray.data.Dataset.write_parquet`. Ray Da
 save text in many formats.
 
 To view the full list of supported file formats, see the
-:ref:`Input/Output reference <input-output>`.
+:ref:`Saving Data API <saving-data-api>`.
 
 .. testcode::
+    :skipif: True
 
     import ray
 
     ds = ray.data.read_text("s3://anonymous@ray-example-data/this.txt")
 
-    ds.write_parquet("local:///tmp/results")
+    ds.write_parquet("s3://my-bucket/results")
 
 For more information on saving data, see :ref:`Saving data <saving-data>`.

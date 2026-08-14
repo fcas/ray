@@ -1,9 +1,13 @@
-import time
-import pytest
-from pytest_docker_tools import container, fetch, network, volume
-from pytest_docker_tools import wrappers
 import subprocess
+import time
 from typing import List
+
+import pytest
+from pytest_docker_tools import container, fetch, network, volume, wrappers
+
+import docker
+
+from ray._common.network_utils import build_address
 
 # If you need to debug tests using fixtures in this file,
 # comment in the volume
@@ -65,14 +69,20 @@ class Container(wrappers.Container):
             print(content.decode())
 
 
-gcs_network = network(driver="bridge")
+# This allows us to assign static ips to docker containers
+ipam_config = docker.types.IPAMConfig(
+    pool_configs=[
+        docker.types.IPAMPool(subnet="192.168.52.0/24", gateway="192.168.52.254")
+    ]
+)
+gcs_network = network(driver="bridge", ipam=ipam_config)
 
 redis_image = fetch(repository="redis:latest")
 
 redis = container(
     image="{redis_image.id}",
     network="{gcs_network.name}",
-    command=("redis-server --save 60 1 --loglevel" " warning"),
+    command=("redis-server --save 60 1 --loglevel warning"),
 )
 
 head_node_vol = volume()
@@ -96,6 +106,8 @@ def gen_head_node(envs):
             # ip:port is treated as a different raylet.
             "--node-manager-port",
             "9379",
+            "--dashboard-host",
+            "0.0.0.0",
         ],
         volumes={"{head_node_vol.name}": {"bind": "/tmp", "mode": "rw"}},
         environment=envs,
@@ -109,7 +121,7 @@ def gen_head_node(envs):
     )
 
 
-def gen_worker_node(envs):
+def gen_worker_node(envs, num_cpus):
     return container(
         image="rayproject/ray:ha_integration",
         network="{gcs_network.name}",
@@ -117,12 +129,14 @@ def gen_worker_node(envs):
             "ray",
             "start",
             "--address",
-            f"{head_node_container_name}:6379",
+            build_address(head_node_container_name, 6379),
             "--block",
             # Fix the port of raylet to make sure raylet restarts at the same
             # ip:port is treated as a different raylet.
             "--node-manager-port",
             "9379",
+            "--num-cpus",
+            f"{num_cpus}",
         ],
         volumes={"{worker_node_vol.name}": {"bind": "/tmp", "mode": "rw"}},
         environment=envs,
@@ -145,11 +159,12 @@ head_node = gen_head_node(
 )
 
 worker_node = gen_worker_node(
-    {
+    envs={
         "RAY_REDIS_ADDRESS": "{redis.ips.primary}:6379",
         "RAY_raylet_client_num_connect_attempts": "10",
         "RAY_raylet_client_connect_timeout_milliseconds": "100",
-    }
+    },
+    num_cpus=8,
 )
 
 
@@ -159,23 +174,38 @@ def docker_cluster(head_node, worker_node):
 
 
 def run_in_container(cmds: List[List[str]], container_id: str):
+    """Run a list of commands in the specified container.
+
+    Checks that each docker command executed without error.
+    Returns the output from each command as a list.
+    """
+
     outputs = []
     for cmd in cmds:
         docker_cmd = ["docker", "exec", container_id] + cmd
         print(f"Executing command: {docker_cmd}", time.time())
-        resp = subprocess.check_output(docker_cmd, stderr=subprocess.STDOUT)
-        output = resp.decode("utf-8").strip()
-        print(f"Output: {output}")
-        outputs.append(output)
+        try:
+            resp = subprocess.check_output(docker_cmd, stderr=subprocess.STDOUT)
+            output = resp.decode("utf-8").strip()
+            print(f"Output: {output}")
+            outputs.append(output)
+        except subprocess.CalledProcessError as e:
+            error_output = e.output.decode("utf-8") if e.output else "No output"
+            print(f"Command failed with return code {e.returncode}")
+            print(f"Full error output:\n{error_output}")
+            raise
 
     return outputs
 
 
 IMAGE_NAME = "rayproject/ray:runtime_env_container"
-NESTED_IMAGE_NAME = "rayproject/ray:runtime_env_container_nested"
+# After `docker save` / `podman load`, Podman typically tags the image as below (not the
+# Docker daemon name). Use that ref for `podman create` so resolution stays local.
+PODMAN_BASE_IMAGE = "localhost/runtime_env_container:latest"
+NESTED_IMAGE_NAME = "localhost/runtime_env_container_nested:latest"
 
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 def podman_docker_cluster():
     start_container_command = [
         "docker",
@@ -196,7 +226,16 @@ def podman_docker_cluster():
         "-f",
         "/dev/null",
     ]
-    container_id = subprocess.check_output(start_container_command).decode("utf-8")
+    try:
+        container_id = subprocess.check_output(
+            start_container_command, stderr=subprocess.STDOUT
+        ).decode("utf-8")
+    except subprocess.CalledProcessError as e:
+        error_output = e.output.decode("utf-8") if e.output else "No output"
+        print(f"Command failed with return code {e.returncode}")
+        print(f"Full error output:\n{error_output}")
+        raise
+
     container_id = container_id.strip()
 
     # Get group id that owns the docker socket file. Add user `ray` to
@@ -210,7 +249,11 @@ def podman_docker_cluster():
             ["id"],
             ["sudo", "groupadd", "-g", docker_group_id, "docker"],
             ["sudo", "usermod", "-aG", "docker", "ray"],
-            ["podman", "pull", f"docker-daemon:{IMAGE_NAME}"],
+            [
+                "bash",
+                "-c",
+                f"docker save {IMAGE_NAME} | podman load",
+            ],
         ],
         container_id,
     )
@@ -233,7 +276,7 @@ app = Model.bind()
         [
             ["bash", "-c", "echo helloworldalice >> /tmp/file.txt"],
             ["bash", "-c", f"echo '{serve_app}' >> /tmp/serve_application.py"],
-            ["podman", "create", "--name", "tmp_container", IMAGE_NAME],
+            ["podman", "create", "--name", "tmp_container", PODMAN_BASE_IMAGE],
             ["podman", "cp", "/tmp/file.txt", "tmp_container:/home/ray/file.txt"],
             [
                 "podman",

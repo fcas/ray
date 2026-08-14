@@ -24,7 +24,7 @@ class ResultGrid:
     .. testcode::
 
         import random
-        from ray import train, tune
+        from ray import tune
         def random_error_trainable(config):
             if random.random() < 0.5:
                 return {"loss": 0.0}
@@ -32,7 +32,7 @@ class ResultGrid:
                 raise ValueError("This is an error")
         tuner = tune.Tuner(
             random_error_trainable,
-            run_config=train.RunConfig(name="example-experiment"),
+            run_config=tune.RunConfig(name="example-experiment"),
             tune_config=tune.TuneConfig(num_samples=10),
         )
         try:
@@ -75,6 +75,12 @@ class ResultGrid:
         self,
         experiment_analysis: ExperimentAnalysis,
     ):
+        """Initialize a ``ResultGrid`` from an ``ExperimentAnalysis``.
+
+        Args:
+            experiment_analysis: The ``ExperimentAnalysis`` produced by the
+                completed Tune run, used to build the per-trial ``Result`` list.
+        """
         self._experiment_analysis = experiment_analysis
         self._results = [
             self._trial_to_result(trial) for trial in self._experiment_analysis.trials
@@ -106,9 +112,21 @@ class ResultGrid:
     ) -> Result:
         """Get the best result from all the trials run.
 
+        For metrics that are reported in a nested dict, use a slash-separated
+        flat key to refer to the nested entry. For example, if a trial reports
+        ``{"eval": {"metrics": {"loss": 0.1}}}``, pass ``metric="eval/metrics/loss"``:
+
+        >>> best_result = result_grid.get_best_result( # doctest: +SKIP
+        ...     metric="eval/metrics/loss", mode="min")
+
+        This works because Tune flattens reported result dicts with ``/`` as the
+        default delimiter before tracking metrics.
+
         Args:
             metric: Key for trial info to order on. Defaults to
                 the metric specified in your Tuner's ``TuneConfig``.
+                For nested metrics, use a slash-separated flat key
+                (e.g. ``"eval/metrics/loss"``).
             mode: One of [min, max]. Defaults to the mode specified
                 in your Tuner's ``TuneConfig``.
             scope: One of [all, last, avg, last-5-avg, last-10-avg].
@@ -124,6 +142,10 @@ class ResultGrid:
             filter_nan_and_inf: If True (default), NaN or infinite
                 values are disregarded and these trials are never selected as
                 the best trial.
+
+        Returns:
+            The ``Result`` corresponding to the best trial under the given
+            metric, mode, and scope.
         """
         if len(self._experiment_analysis.trials) == 1:
             return self._trial_to_result(self._experiment_analysis.trials[0])
@@ -182,16 +204,14 @@ class ResultGrid:
 
             .. testcode::
 
-                from ray import train
-                from ray.train import RunConfig
-                from ray.tune import Tuner
+                import ray.tune
 
                 def training_loop_per_worker(config):
-                    train.report({"accuracy": 0.8})
+                    ray.tune.report({"accuracy": 0.8})
 
-                result_grid = Tuner(
+                result_grid = ray.tune.Tuner(
                     trainable=training_loop_per_worker,
-                    run_config=RunConfig(name="my_tune_run")
+                    run_config=ray.tune.RunConfig(name="my_tune_run")
                 ).fit()
 
                 # Get last reported results per trial

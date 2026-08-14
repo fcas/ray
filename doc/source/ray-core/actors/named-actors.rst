@@ -1,3 +1,6 @@
+.. meta::
+   :description: Give an actor a unique name in its namespace so any job in the cluster can retrieve it, with get-or-create and actor lifetime options.
+
 Named Actors
 ============
 
@@ -52,7 +55,7 @@ exist. See :ref:`actor-lifetimes` for more details.
             // Retrieve the actor later somewhere
             boost::optional<ray::ActorHandle<Counter>> counter = ray::GetGlobalActor("some_name");
 
-        We also support non-global named actors in C++, which means that the actor name is only valid within the job and the actor cannot be accessed from another job
+        We also support non-global named actors in C++, which means that the actor name is only valid within the job and the actor cannot be accessed from another job.
 
         .. code-block:: c++
 
@@ -80,7 +83,7 @@ exist. See :ref:`actor-lifetimes` for more details.
 
             @ray.remote
             class Actor:
-              pass
+                pass
 
             # driver_1.py
             # Job 1 creates an actor, "orange" in the "colors" namespace.

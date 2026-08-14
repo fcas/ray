@@ -1,3 +1,6 @@
+.. meta::
+   :description: Reference for Tune's LoggerCallback interface and built-in loggers, plus the MLflow, Weights & Biases, Comet, and Aim integrations.
+
 .. _loggers-docstring:
 
 Tune Loggers (tune.logger)
@@ -59,8 +62,10 @@ See the :doc:`tutorial here </tune/examples/tune-mlflow>`.
 
 .. autosummary::
     :nosignatures:
+    :toctree: doc/
 
-    tune.logger.mlflow.MLflowLoggerCallback
+    ~air.integrations.mlflow.MLflowLoggerCallback
+    ~air.integrations.mlflow.setup_mlflow
 
 Wandb Integration
 -----------------
@@ -71,8 +76,10 @@ See the :doc:`tutorial here </tune/examples/tune-wandb>`.
 
 .. autosummary::
     :nosignatures:
+    :toctree: doc/
 
-    tune.logger.wandb.WandbLoggerCallback
+    ~air.integrations.wandb.WandbLoggerCallback
+    ~air.integrations.wandb.setup_wandb
 
 
 Comet Integration
@@ -84,15 +91,16 @@ See the :doc:`tutorial here </tune/examples/tune-comet>`.
 
 .. autosummary::
     :nosignatures:
+    :toctree: doc/
 
-    tune.logger.comet.CometLoggerCallback
+    ~air.integrations.comet.CometLoggerCallback
 
 Aim Integration
 ---------------
 
 Tune also provides a logger for the `Aim <https://aimstack.io/>`_ experiment tracker.
 You can install Aim via ``pip install aim``.
-See the :doc:`tutorial here </tune/examples/tune-aim>`
+See the :doc:`tutorial here </tune/examples/tune-aim>`.
 
 .. autosummary::
     :nosignatures:
@@ -112,11 +120,10 @@ To use VisKit (you may have to install some dependencies), run:
 
 .. code-block:: bash
 
-    $ git clone https://github.com/rll/rllab.git
-    $ python rllab/rllab/viskit/frontend.py ~/ray_results/my_experiment
+    $ git clone https://github.com/vitchyr/viskit.git
+    $ python viskit/viskit/frontend.py ~/ray_results/my_experiment
 
 The non-relevant metrics (like timing stats) can be disabled on the left to show only the
 relevant ones (like accuracy, loss, etc.).
 
 .. image:: ../images/ray-tune-viskit.png
-

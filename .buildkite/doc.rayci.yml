@@ -1,0 +1,130 @@
+# Documentation pipeline. The steps below, in order:
+#
+#   docbuild / docgpubuild  Build the container images the steps below run in.
+#   doc: build              Build the HTML site (make html) and, on postmerge
+#                           master builds only, upload the artifacts as a cache.
+#                           Tagged skip-on-premerge, so it does not gate PRs.
+#   doc: check API ...      The two API-reference guards. They compare Ray's
+#                           annotated public surface against what the reference
+#                           pages document. See the comment above them for why
+#                           they carry no `if:` guard.
+#   doc: test llms.txt      Self-test for an in-repo Sphinx extension.
+#   doc: linkcheck          Sphinx linkcheck over the built site. Both
+#                           skip-on-premerge and soft_fail, so it reports
+#                           without ever blocking.
+#
+# Which of these run on a given pull request is decided by tags, not by
+# anything in this file; the file-to-tag rules live in .buildkite/test.rules.txt.
+# Read the docs build itself is a separate system and is not configured here.
+group: doc
+steps:
+  - name: docbuild
+    label: "wanda: docbuild-py{{matrix}}"
+    wanda: ci/docker/doc.build.wanda.yaml
+    depends_on:
+      - oss-ci-base_build-multipy(python=3.11)
+      - ray-core-build(python=3.11)
+      - ray-dashboard-build
+    matrix:
+      - "3.11"
+    env:
+      PYTHON: "{{matrix}}"
+      REQUIREMENTS_FILE: "python/deplocks/docs/docbuild_depset_py{{matrix}}.lock"
+    tags: cibase
+
+  - name: docgpubuild
+    label: "wanda: docgpubuild-py3.10"
+    wanda: ci/docker/docgpu.build.wanda.yaml
+    depends_on: oss-ci-base_gpu-multipy(python=3.10)
+    env:
+      PYTHON: "3.10"
+    tags: cibase
+
+  - label: ":book: doc: build"
+    key: doc_build
+    instance_type: medium
+    commands:
+      - bazel run //ci/ray_ci/doc:cmd_build
+    depends_on: docbuild
+    job_env: docbuild-py3.11
+    tags:
+      - oss
+      - doc
+      - skip-on-premerge
+
+  # The two API checks below carry no `if:` guard on purpose. Their trigger set
+  # is defined entirely by tags: the library code tags, plus "doc_api" for the
+  # API reference pages and the autodoc machinery that decides what those pages
+  # contain (see test.rules.txt). Tag selection and Buildkite `if:` are separate
+  # passes -- tags choose which steps are emitted, `if:` can only suppress an
+  # already-emitted step -- so a label guard here could only ever subtract from
+  # a trigger set the rules already compute correctly. In particular these steps
+  # are deliberately NOT gated on "docs-go": that label exists to skip the
+  # per-team doc example execution on a content-only PR, and an API reference
+  # page edit is exactly the content-only change these checks must still cover.
+  - label: ":book: doc: check API annotations"
+    tags:
+      - oss
+      - core_python
+      - dashboard
+      - ray_client
+      - data
+      - serve
+      - ml
+      - tune
+      - train
+      - llm
+      - rllib
+      - rllib_gpu
+      - doc_api
+    key: doc_api_annotations
+    instance_type: medium
+    depends_on: docbuild
+    job_env: docbuild-py3.11
+    commands:
+      - bash ci/lint/lint.sh api_annotations
+
+  - label: ":book: doc: check API doc consistency"
+    tags:
+      - oss
+      - core_python
+      - dashboard
+      - ray_client
+      - data
+      - serve
+      - ml
+      - tune
+      - train
+      - llm
+      - rllib
+      - rllib_gpu
+      - doc_api
+    key: doc_api_policy_check
+    instance_type: medium
+    depends_on: docbuild
+    job_env: docbuild-py3.11
+    commands:
+      - bash ci/lint/lint.sh api_policy_check
+
+  - label: ":book: doc: test llms.txt extension"
+    key: doc_test_llms_txt
+    instance_type: small
+    commands:
+      - python doc/source/_ext/test_llms_txt.py
+    depends_on: docbuild
+    job_env: docbuild-py3.11
+    tags:
+      - oss
+      - doc
+
+  - label: ":book: doc: linkcheck"
+    key: doc_linkcheck
+    instance_type: medium
+    commands:
+      - make -C doc/ linkcheck_all
+    depends_on: docbuild
+    job_env: docbuild-py3.11
+    tags:
+      - oss
+      - skip-on-premerge
+    soft_fail: true

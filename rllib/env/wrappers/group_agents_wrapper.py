@@ -1,6 +1,7 @@
 from collections import OrderedDict
-import gymnasium as gym
 from typing import Dict, List, Optional
+
+import gymnasium as gym
 
 from ray.rllib.env.multi_agent_env import MultiAgentEnv
 from ray.rllib.utils.annotations import DeveloperAPI
@@ -131,7 +132,10 @@ class GroupAgentsWrapper(MultiAgentEnv):
                 out[agent_id] = value
         return out
 
-    def _group_items(self, items, agg_fn=lambda gvals: list(gvals.values())):
+    def _group_items(self, items, agg_fn=None):
+        if agg_fn is None:
+            agg_fn = lambda gvals: list(gvals.values())  # noqa: E731
+
         grouped_items = {}
         for agent_id, item in items.items():
             if agent_id in self.agent_id_to_group:

@@ -7,23 +7,23 @@ import unittest
 # coding: utf-8
 # coding: utf-8
 from collections import defaultdict
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Union
+from unittest import mock
 from unittest.mock import MagicMock
 
 import pytest  # noqa
 
 import ray
-from ray._private.test_utils import get_test_config_path, wait_for_condition
+from ray._common.test_utils import wait_for_condition
+from ray._private.test_utils import get_test_config_path
 from ray.autoscaler._private.constants import (
     AUTOSCALER_MAX_CONCURRENT_LAUNCHES,
     AUTOSCALER_MAX_LAUNCH_BATCH,
 )
 from ray.autoscaler._private.fake_multi_node.node_provider import FakeMultiNodeProvider
-from ray.autoscaler._private.kuberay.node_provider import (
-    KUBERAY_TYPE_HEAD,
-    IKubernetesHttpApiClient,
-)
+from ray.autoscaler._private.kuberay.node_provider import IKubernetesHttpApiClient
 from ray.autoscaler.v2.instance_manager.cloud_providers.kuberay.cloud_provider import (
+    NO_DRIVER_TTL_EXPIRED_ANNOTATION,
     KubeRayProvider,
 )
 from ray.autoscaler.v2.instance_manager.config import (
@@ -195,6 +195,7 @@ def get_provider():
 def test_node_providers_basic(get_provider, provider_name):
     # Test launching.
     provider = get_provider(name=provider_name)
+    timeout_s = 30 if provider_name == "fake_multi" else 10
     provider.launch(
         shape={"worker_nodes": 2},
         request_id="1",
@@ -214,7 +215,7 @@ def test_node_providers_basic(get_provider, provider_name):
         assert nodes_by_type == {"worker_nodes": 4, "worker_nodes1": 1}
         return True
 
-    wait_for_condition(verify)
+    wait_for_condition(verify, timeout=timeout_s)
 
     nodes = provider.get_non_terminated().keys()
 
@@ -240,7 +241,7 @@ def test_node_providers_basic(get_provider, provider_name):
             assert node.request_id == "4"
         return True
 
-    wait_for_condition(verify)
+    wait_for_condition(verify, timeout=timeout_s)
 
 
 @pytest.mark.parametrize(
@@ -355,27 +356,41 @@ class MockKubernetesHttpApiClient(IKubernetesHttpApiClient):
 
         raise NotImplementedError(f"get {path}")
 
-    def patch(self, path: str, patches: List[Dict[str, Any]]):
+    def patch(
+        self,
+        path: str,
+        patches: Union[List[Dict[str, Any]], Dict[str, Any]],
+        content_type: str = "application/json-patch+json",
+    ):
         self._patches[path] = patches
         return {path: patches}
 
-    def get_patches(self, path: str) -> List[Dict[str, Any]]:
+    def get_patches(self, path: str) -> Union[List[Dict[str, Any]], Dict[str, Any]]:
         return self._patches[path]
 
 
 class KubeRayProviderIntegrationTest(unittest.TestCase):
     def setUp(self):
+        raycluster_cr = get_basic_ray_cr()
+        # Remove fake TPU and GPU worker groups from CR since podlist1 only
+        # contains small-group.
+        raycluster_cr["spec"]["workerGroupSpecs"][1]["replicas"] = 0
+        raycluster_cr["spec"]["workerGroupSpecs"][2]["replicas"] = 0
         self.mock_client = MockKubernetesHttpApiClient(
-            _get_test_yaml("podlist1.yaml"), get_basic_ray_cr()
+            _get_test_yaml("podlist1.yaml"), raycluster_cr
         )
         self.provider = KubeRayProvider(
             cluster_name="test",
             provider_config={
                 "namespace": "default",
-                "head_node_type": KUBERAY_TYPE_HEAD,
+                "head_node_type": "headgroup",
             },
+            gcs_client=MagicMock(),
             k8s_api_client=self.mock_client,
         )
+        # In production _sync_with_api_server caches the CR before the
+        # no-driver annotation is set; mirror that for the dispatch tests.
+        self.provider._ray_cluster = raycluster_cr
 
     def test_get_nodes(self):
         nodes = self.provider.get_non_terminated()
@@ -389,7 +404,7 @@ class KubeRayProviderIntegrationTest(unittest.TestCase):
                 "raycluster-autoscaler-head-8zsc8": CloudInstance(
                     cloud_instance_id="raycluster-autoscaler-head-8zsc8",
                     node_kind=NodeKind.HEAD,
-                    node_type="head-group",
+                    node_type="headgroup",
                     is_running=True,
                 ),  # up-to-date status because the Ray container is in running status
                 "raycluster-autoscaler-worker-small-group-dkz2r": CloudInstance(
@@ -492,6 +507,492 @@ class KubeRayProviderIntegrationTest(unittest.TestCase):
                 "op": "replace",
                 "path": "/spec/workerGroupSpecs/0/scaleStrategy",
                 "value": {"workersToDelete": []},
+            },
+        ]
+
+    def test_increase_min_replicas_to_scale_up(self):
+        # Simulate the case where users manually increase the `minReplicas` field
+        # from 0 to $num_pods. KubeRay will create $num_pods worker Pods to meet the new
+        # `minReplicas`, even though the `replicas` field is still 0.
+        small_group = "small-group"
+        num_pods = 0
+        assert (
+            self.mock_client._ray_cluster["spec"]["workerGroupSpecs"][0]["groupName"]
+            == small_group
+        )
+        for pod in self.mock_client._pod_list["items"]:
+            if pod["metadata"]["labels"]["ray.io/group"] == small_group:
+                num_pods += 1
+        assert num_pods > 0
+        self.mock_client._ray_cluster["spec"]["workerGroupSpecs"][0]["replicas"] = 0
+        self.mock_client._ray_cluster["spec"]["workerGroupSpecs"][0][
+            "minReplicas"
+        ] = num_pods
+
+        # Launching a new node and `replicas` should be
+        # `max(replicas, minReplicas) + 1`.
+        self.provider.launch(shape={small_group: 1}, request_id="launch-1")
+        patches = self.mock_client.get_patches(
+            f"rayclusters/{self.provider._cluster_name}"
+        )
+        assert len(patches) == 1
+        assert patches[0] == {
+            "op": "replace",
+            "path": "/spec/workerGroupSpecs/0/replicas",
+            "value": num_pods + 1,
+        }
+
+    def test_inconsistent_pods_raycr_scale_up(self):
+        """
+        Test the case where the cluster state has not yet reached the desired state.
+        Specifically, the replicas field in the RayCluster CR does not match the actual
+        number of Pods.
+        """
+        # Check the assumptions of the test
+        small_group = "small-group"
+        num_pods = 0
+        for pod in self.mock_client._pod_list["items"]:
+            if pod["metadata"]["labels"]["ray.io/group"] == small_group:
+                num_pods += 1
+
+        assert (
+            self.mock_client._ray_cluster["spec"]["workerGroupSpecs"][0]["groupName"]
+            == small_group
+        )
+        desired_replicas = num_pods + 1
+        self.mock_client._ray_cluster["spec"]["workerGroupSpecs"][0][
+            "replicas"
+        ] = desired_replicas
+
+        # Launch a new node. The replicas field should be incremented by 1, even though
+        # the cluster state has not yet reached the goal state.
+        launch_request = {"small-group": 1}
+        self.provider.launch(shape=launch_request, request_id="launch-1")
+
+        patches = self.mock_client.get_patches(
+            f"rayclusters/{self.provider._cluster_name}"
+        )
+        assert len(patches) == 1
+        assert patches[0] == {
+            "op": "replace",
+            "path": "/spec/workerGroupSpecs/0/replicas",
+            "value": desired_replicas + 1,
+        }
+
+    def test_inconsistent_pods_raycr_scale_down(self):
+        """
+        Test the case where the cluster state has not yet reached the desired state.
+        Specifically, the replicas field in the RayCluster CR does not match the actual
+        number of Pods.
+        """
+        # Check the assumptions of the test
+        small_group = "small-group"
+        num_pods = 0
+        pod_to_delete = None
+        for pod in self.mock_client._pod_list["items"]:
+            if pod["metadata"]["labels"]["ray.io/group"] == small_group:
+                num_pods += 1
+                pod_to_delete = pod["metadata"]["name"]
+        assert pod_to_delete is not None
+
+        assert (
+            self.mock_client._ray_cluster["spec"]["workerGroupSpecs"][0]["groupName"]
+            == small_group
+        )
+        desired_replicas = num_pods + 1
+        self.mock_client._ray_cluster["spec"]["workerGroupSpecs"][0][
+            "replicas"
+        ] = desired_replicas
+
+        # Terminate a node. The replicas field should be decremented by 1, even though
+        # the cluster state has not yet reached the goal state.
+        self.provider.terminate(ids=[pod_to_delete], request_id="term-1")
+        patches = self.mock_client.get_patches(
+            f"rayclusters/{self.provider._cluster_name}"
+        )
+        assert len(patches) == 2
+        assert patches == [
+            {
+                "op": "replace",
+                "path": "/spec/workerGroupSpecs/0/replicas",
+                "value": desired_replicas - 1,
+            },
+            {
+                "op": "replace",
+                "path": "/spec/workerGroupSpecs/0/scaleStrategy",
+                "value": {
+                    "workersToDelete": [
+                        pod_to_delete,
+                    ]
+                },
+            },
+        ]
+
+    def test_decrease_cr_replicas_below_observed_then_scale_down(self):
+        """
+        If a user/operator decreases the CR's replicas below the observed number of
+        Pods without specifying workersToDelete, scaling down should base the
+        new desired on observed (floor), decrement by one, and add the pod to
+        workersToDelete.
+        """
+        # Prepare a RayCluster CR with replicas set to 0 for the small-group
+        # while the pod list contains multiple small-group pods.
+        raycluster_cr = get_basic_ray_cr()
+        mock_client = MockKubernetesHttpApiClient(
+            _get_test_yaml("podlist2.yaml"), raycluster_cr
+        )
+
+        small_group = "small-group"
+        pod_names = []
+        for pod in mock_client._pod_list["items"]:
+            if pod["metadata"]["labels"]["ray.io/group"] == small_group:
+                pod_names.append(pod["metadata"]["name"])
+        assert len(pod_names) >= 2
+
+        # Decrease CR replicas below observed without workersToDelete.
+        assert raycluster_cr["spec"]["workerGroupSpecs"][0]["groupName"] == small_group
+        raycluster_cr["spec"]["workerGroupSpecs"][0]["replicas"] = 0
+
+        provider = KubeRayProvider(
+            cluster_name="test",
+            provider_config={
+                "namespace": "default",
+                "head_node_type": "headgroup",
+            },
+            gcs_client=MagicMock(),
+            k8s_api_client=mock_client,
+        )
+
+        # Terminate a single observed pod.
+        pod_to_delete = pod_names[0]
+        provider.terminate(ids=[pod_to_delete], request_id="term-decrease")
+
+        # Expected: replicas becomes observed-1; workersToDelete contains the pod.
+        patches = mock_client.get_patches(f"rayclusters/{provider._cluster_name}")
+        assert len(patches) == 2
+        assert patches == [
+            {
+                "op": "replace",
+                "path": "/spec/workerGroupSpecs/0/replicas",
+                "value": len(pod_names) - 1,
+            },
+            {
+                "op": "replace",
+                "path": "/spec/workerGroupSpecs/0/scaleStrategy",
+                "value": {
+                    "workersToDelete": [
+                        pod_to_delete,
+                    ]
+                },
+            },
+        ]
+
+    def test_scale_down_multiple_pods_of_node_type(self):
+        """
+        Test the case where multiple pods of the same node type are scaled
+        down on one autoscaler iteration. This test verifies that the provider
+        properly handles multiple pod deletions and counting workers_to_delete.
+        """
+        # Setup provider with multiple worker pods in podlist. We use podlist2
+        # here because podlist1 only contains one running worker.
+        raycluster_cr = get_basic_ray_cr()
+        raycluster_cr["spec"]["workerGroupSpecs"][0]["replicas"] = 2
+        mock_client = MockKubernetesHttpApiClient(
+            _get_test_yaml("podlist2.yaml"), raycluster_cr
+        )
+        provider = KubeRayProvider(
+            cluster_name="test",
+            provider_config={
+                "namespace": "default",
+                "head_node_type": "headgroup",
+            },
+            gcs_client=MagicMock(),
+            k8s_api_client=mock_client,
+        )
+
+        # Identify all pods in the target group
+        small_group = "small-group"
+        pod_names = []
+        for pod in mock_client._pod_list["items"]:
+            if pod["metadata"]["labels"]["ray.io/group"] == small_group:
+                pod_names.append(pod["metadata"]["name"])
+
+        # Terminate all pods in the group
+        provider._sync_with_api_server()
+        cur_instance_ids = set(provider.instances.keys())
+        pods_to_terminate = [name for name in pod_names if name in cur_instance_ids]
+
+        assert (
+            len(pods_to_terminate) > 1
+        ), "Expected multiple pods to terminate in the target group."
+
+        provider.terminate(ids=pods_to_terminate, request_id="term-2")
+
+        # Check the patches applied to the RayCluster resource
+        patches = mock_client.get_patches(f"rayclusters/{provider._cluster_name}")
+
+        assert len(patches) == 2
+        assert patches == [
+            {
+                "op": "replace",
+                "path": "/spec/workerGroupSpecs/0/replicas",
+                "value": 0,
+            },
+            {
+                "op": "replace",
+                "path": "/spec/workerGroupSpecs/0/scaleStrategy",
+                "value": {
+                    "workersToDelete": pods_to_terminate,
+                },
+            },
+        ]
+
+    def test_worker_to_delete_info(self):
+        """
+        Validate _get_workers_delete_info correctly returns the worker groups with pending
+        deletes, worker groups with finished deletes, and the set of workers to delete.
+        """
+        # Create a RayCluster CR and set replicas to 0 to simulate the case where the autoscaler
+        # patches the RayCluster with `replicas: 0`, but alive Pods still exist in workersToDelete.
+        raycluster_cr = get_basic_ray_cr()
+        raycluster_cr["spec"]["workerGroupSpecs"][0]["replicas"] = 0
+        mock_client = MockKubernetesHttpApiClient(
+            _get_test_yaml("podlist2.yaml"), raycluster_cr
+        )
+
+        # Add some workers to workersToDelete.
+        small_group = "small-group"
+        pod_names = []
+        for pod in mock_client._pod_list["items"]:
+            if pod["metadata"]["labels"]["ray.io/group"] == small_group:
+                pod_names.append(pod["metadata"]["name"])
+        raycluster_cr["spec"]["workerGroupSpecs"][0]["scaleStrategy"] = {
+            "workersToDelete": pod_names,
+        }
+
+        (
+            pending_deletes,
+            finished_deletes,
+            workers_to_delete,
+        ) = KubeRayProvider._get_workers_delete_info(raycluster_cr, set(pod_names))
+
+        # Validate _get_workers_delete_info populates sets as expected.
+        assert pending_deletes == {"small-group"}
+        assert finished_deletes == set()
+        assert workers_to_delete == {pod_names[0], pod_names[1]}
+
+    def test_set_no_driver_annotation_adds_when_absent(self):
+        self.provider._set_no_driver_annotation()
+        path = f"rayclusters/{self.provider._cluster_name}"
+        patch = self.mock_client.get_patches(path)
+        assert patch == {
+            "metadata": {"annotations": {NO_DRIVER_TTL_EXPIRED_ANNOTATION: "true"}}
+        }
+
+    def test_set_no_driver_annotation_idempotent(self):
+        self.provider._ray_cluster.setdefault("metadata", {}).setdefault(
+            "annotations", {}
+        )[NO_DRIVER_TTL_EXPIRED_ANNOTATION] = "true"
+
+        self.provider._set_no_driver_annotation()
+        path = f"rayclusters/{self.provider._cluster_name}"
+        assert path not in self.mock_client._patches
+
+    def test_set_no_driver_annotation_swallows_patch_failure(self):
+        path = f"rayclusters/{self.provider._cluster_name}"
+
+        def failing_patch(*args, **kwargs):
+            raise RuntimeError("k8s unreachable")
+
+        self.mock_client.patch = failing_patch
+        # Should not raise.
+        self.provider._set_no_driver_annotation()
+        assert path not in self.mock_client._patches
+
+    # --- No-driver termination predicate + dispatch ---
+
+    def _make_gcs(self, *jobs):
+        class _Config:
+            def __init__(self, ray_namespace):
+                self.ray_namespace = ray_namespace
+
+        class _Job:
+            def __init__(self, dead, ray_namespace, end_time=0):
+                self.is_dead = dead
+                self.end_time = end_time
+                self.config = _Config(ray_namespace)
+
+        class _Gcs:
+            def get_all_job_info(self, **_):
+                return {i: _Job(*job) for i, job in enumerate(jobs)}
+
+        return _Gcs()
+
+    def test_driver_status_filters_internal(self):
+        gcs = self._make_gcs(
+            (False, "_ray_internal_dashboard"),
+            (False, "_ray_internal_something"),
+        )
+        self.provider._gcs_client = gcs
+        assert self.provider._driver_status()[0] is False
+
+    def test_driver_status_counts_user_driver(self):
+        gcs = self._make_gcs(
+            (False, "_ray_internal_dashboard"),
+            (False, "default"),
+        )
+        self.provider._gcs_client = gcs
+        assert self.provider._driver_status()[0] is True
+
+    def test_driver_status_ignores_dead(self):
+        gcs = self._make_gcs((True, "default", 42))
+        self.provider._gcs_client = gcs
+        assert self.provider._driver_status() == (False, 42)
+
+    def test_driver_status_fail_closed(self):
+        class _FailingGcs:
+            def get_all_job_info(self, **_):
+                raise RuntimeError("gcs unreachable")
+
+        self.provider._gcs_client = _FailingGcs()
+        assert self.provider._driver_status()[0] is True
+
+    def test_evaluate_no_driver_termination_disabled_when_timeout_none(self):
+        path = f"rayclusters/{self.provider._cluster_name}"
+        self.provider._gcs_client = self._make_gcs()  # no drivers
+        self.provider._no_driver_timeout_seconds = None
+        self.provider._evaluate_no_driver_termination()
+        assert path not in self.mock_client._patches
+        assert self.provider._no_driver_observed_since is None
+
+    def test_evaluate_no_driver_termination_waits_for_timeout(self):
+        self.provider._gcs_client = self._make_gcs()  # no drivers
+        self.provider._no_driver_timeout_seconds = 100.0
+
+        def evaluate_at(t):
+            with mock.patch("time.monotonic", return_value=t):
+                self.provider._evaluate_no_driver_termination()
+
+        path = f"rayclusters/{self.provider._cluster_name}"
+        evaluate_at(0.0)
+        assert path not in self.mock_client._patches  # anchored, not yet
+        evaluate_at(50.0)
+        assert path not in self.mock_client._patches  # still below timeout
+        evaluate_at(100.0)
+        assert self.mock_client._patches.get(path) == {
+            "metadata": {"annotations": {NO_DRIVER_TTL_EXPIRED_ANNOTATION: "true"}}
+        }
+
+    def test_evaluate_no_driver_termination_resets_when_driver_attaches(self):
+        path = f"rayclusters/{self.provider._cluster_name}"
+        self.provider._no_driver_timeout_seconds = 100.0
+
+        with mock.patch("time.monotonic", return_value=0.0):
+            self.provider._gcs_client = self._make_gcs()  # no drivers
+            self.provider._evaluate_no_driver_termination()
+        assert self.provider._no_driver_observed_since == 0.0
+
+        # Driver attaches → anchor cleared, no patch.
+        with mock.patch("time.monotonic", return_value=50.0):
+            self.provider._gcs_client = self._make_gcs((False, "default"))
+            self.provider._evaluate_no_driver_termination()
+        assert self.provider._no_driver_observed_since is None
+        assert path not in self.mock_client._patches
+
+    def test_evaluate_no_driver_termination_resets_on_intermittent_driver(self):
+        self.provider._no_driver_timeout_seconds = 100.0
+
+        # No driver: anchor at t=0.
+        with mock.patch("time.monotonic", return_value=0.0):
+            self.provider._gcs_client = self._make_gcs()
+            self.provider._evaluate_no_driver_termination()
+        assert self.provider._no_driver_observed_since == 0.0
+
+        # A short-lived driver started and finished between loops (a dead job
+        # with a newer end time): the timer must restart.
+        with mock.patch("time.monotonic", return_value=50.0):
+            self.provider._gcs_client = self._make_gcs((True, "default", 42))
+            self.provider._evaluate_no_driver_termination()
+        assert self.provider._no_driver_observed_since == 50.0
+        assert self.provider._last_seen_job_end_time == 42
+
+    def test_refresh_no_driver_timeout_seconds_reads_value(self):
+        self.provider._ray_cluster = {
+            "spec": {"autoscalerOptions": {"noDriverTimeoutSeconds": 1800}}
+        }
+        self.provider._refresh_no_driver_timeout_seconds()
+        assert self.provider._no_driver_timeout_seconds == 1800.0
+
+    def test_refresh_no_driver_timeout_seconds_unset(self):
+        self.provider._ray_cluster = {"spec": {"autoscalerOptions": {}}}
+        self.provider._refresh_no_driver_timeout_seconds()
+        assert self.provider._no_driver_timeout_seconds is None
+
+    def test_refresh_no_driver_timeout_seconds_no_autoscaler_options(self):
+        self.provider._ray_cluster = {"spec": {}}
+        self.provider._refresh_no_driver_timeout_seconds()
+        assert self.provider._no_driver_timeout_seconds is None
+
+    def test_scale_down_with_multi_host_group(self):
+        """
+        Test the case where a worker group has numOfHosts > 1.
+        This ensures that the KubeRay provider accounts for multi-host replicas
+        during scale down and properly updates the workersToDelete field.
+        """
+        # Setup mock RayCluster CR with numOfHosts: 2 and replicas: 1,
+        # resulting in 2 workers total.
+        raycluster_cr = get_basic_ray_cr()
+        raycluster_cr["spec"]["workerGroupSpecs"][0]["replicas"] = 2
+        mock_client = MockKubernetesHttpApiClient(
+            _get_test_yaml("podlist2.yaml"), raycluster_cr
+        )
+        provider = KubeRayProvider(
+            cluster_name="test",
+            provider_config={
+                "namespace": "default",
+                "head_node_type": "headgroup",
+            },
+            gcs_client=MagicMock(),
+            k8s_api_client=mock_client,
+        )
+
+        # Identify all pods in the multi-host group
+        pod_names = []
+        for pod in mock_client._pod_list["items"]:
+            if pod["metadata"]["labels"]["ray.io/group"] == "tpu-group":
+                pod_names.append(pod["metadata"]["name"])
+
+        # Expect 2 pods since replicas=1 and numOfHosts=2
+        assert len(pod_names) == 2, "Expected 2 pods in the multi-host group."
+
+        # Sync provider state and mark all pods for deletion
+        provider._sync_with_api_server()
+        cur_instance_ids = set(provider.instances.keys())
+        pods_to_terminate = [name for name in pod_names if name in cur_instance_ids]
+
+        assert (
+            len(pods_to_terminate) == 2
+        ), "Expected all multi-host pods to be tracked by the provider."
+
+        # Terminate all pods in the group
+        provider.terminate(ids=pods_to_terminate, request_id="term-multi")
+
+        # Check that scale request successfully created
+        patches = mock_client.get_patches(f"rayclusters/{provider._cluster_name}")
+
+        assert len(patches) == 2
+        assert patches == [
+            {
+                "op": "replace",
+                "path": "/spec/workerGroupSpecs/2/replicas",
+                "value": 0,
+            },
+            {
+                "op": "replace",
+                "path": "/spec/workerGroupSpecs/2/scaleStrategy",
+                "value": {
+                    "workersToDelete": pods_to_terminate,
+                },
             },
         ]
 

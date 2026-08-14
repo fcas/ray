@@ -1,4 +1,5 @@
 # coding: utf-8
+import importlib
 import logging
 import os
 import pickle
@@ -10,19 +11,21 @@ import numpy as np
 import pytest
 
 import ray
+import ray._private.ray_constants
 import ray._private.utils
-import ray.cluster_utils
-import ray.util.accelerators
 from ray._private.test_utils import check_call_ray, wait_for_num_actors
+from ray.util.state import list_actors
 
-import setproctitle
+import psutil
 
 logger = logging.getLogger(__name__)
 
 
 def test_global_state_api(shutdown_only):
 
-    ray.init(num_cpus=5, num_gpus=3, resources={"CustomResource": 1})
+    ray.init(
+        num_cpus=5, num_gpus=3, resources={"CustomResource": 1}, include_dashboard=True
+    )
 
     assert ray.cluster_resources()["CPU"] == 5
     assert ray.cluster_resources()["GPU"] == 3
@@ -47,15 +50,12 @@ def test_global_state_api(shutdown_only):
     # Wait for actor to be created
     wait_for_num_actors(1)
 
-    actor_table = ray._private.state.actors()
+    actor_table = list_actors()  # should be using this API now for fetching actors
     assert len(actor_table) == 1
 
-    (actor_info,) = actor_table.values()
-    assert actor_info["JobID"] == job_id.hex()
-    assert actor_info["Name"] == "test_actor"
-    assert "IPAddress" in actor_info["Address"]
-    assert "IPAddress" in actor_info["OwnerAddress"]
-    assert actor_info["Address"]["Port"] != actor_info["OwnerAddress"]["Port"]
+    actor_info = actor_table[0]
+    assert actor_info.job_id == job_id.hex()
+    assert actor_info.name == "test_actor"
 
     job_table = ray._private.state.jobs()
 
@@ -64,44 +64,7 @@ def test_global_state_api(shutdown_only):
     assert job_table[0]["DriverIPAddress"] == node_ip_address
 
 
-# TODO(rkn): Pytest actually has tools for capturing stdout and stderr, so we
-# should use those, but they seem to conflict with Ray's use of faulthandler.
-class CaptureOutputAndError:
-    """Capture stdout and stderr of some span.
-
-    This can be used as follows.
-
-        captured = {}
-        with CaptureOutputAndError(captured):
-            # Do stuff.
-        # Access captured["out"] and captured["err"].
-    """
-
-    def __init__(self, captured_output_and_error):
-        import io
-
-        self.output_buffer = io.StringIO()
-        self.error_buffer = io.StringIO()
-        self.captured_output_and_error = captured_output_and_error
-
-    def __enter__(self):
-        sys.stdout.flush()
-        sys.stderr.flush()
-        self.old_stdout = sys.stdout
-        self.old_stderr = sys.stderr
-        sys.stdout = self.output_buffer
-        sys.stderr = self.error_buffer
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        sys.stdout.flush()
-        sys.stderr.flush()
-        sys.stdout = self.old_stdout
-        sys.stderr = self.old_stderr
-        self.captured_output_and_error["out"] = self.output_buffer.getvalue()
-        self.captured_output_and_error["err"] = self.error_buffer.getvalue()
-
-
-def test_logging_to_driver(shutdown_only):
+def test_logging_to_driver(capsys, shutdown_only):
     ray.init(num_cpus=1, log_to_driver=True)
 
     @ray.remote
@@ -112,21 +75,40 @@ def test_logging_to_driver(shutdown_only):
             print(i, end=" ")
             print(100 + i, end=" ", file=sys.stderr)
 
-    captured = {}
-    with CaptureOutputAndError(captured):
-        ray.get(f.remote())
-        time.sleep(1)
+    ray.get(f.remote())
+    time.sleep(1)
 
-    out_lines = captured["out"]
-    err_lines = captured["err"]
+    out, err = capsys.readouterr()
     for i in range(10):
-        assert str(i) in out_lines
+        assert str(i) in out
 
     for i in range(100, 110):
-        assert str(i) in err_lines
+        assert str(i) in err
 
 
-def test_not_logging_to_driver(shutdown_only):
+def test_not_logging_to_driver_via_env_var(monkeypatch, capsys, shutdown_only):
+    monkeypatch.setenv("RAY_LOG_TO_DRIVER", "0")
+    importlib.reload(ray._private.ray_constants)
+    ray.init(num_cpus=1)
+
+    @ray.remote
+    def f():
+        for i in range(100):
+            print(i)
+            print(100 + i, file=sys.stderr)
+            sys.stdout.flush()
+            sys.stderr.flush()
+
+    capsys.readouterr()
+    ray.get(f.remote())
+    time.sleep(1)
+
+    out, err = capsys.readouterr()
+    assert len(out) == 0
+    assert len(err) == 0
+
+
+def test_not_logging_to_driver(capsys, shutdown_only):
     ray.init(num_cpus=1, log_to_driver=False)
 
     @ray.remote
@@ -137,16 +119,13 @@ def test_not_logging_to_driver(shutdown_only):
             sys.stdout.flush()
             sys.stderr.flush()
 
-    captured = {}
-    with CaptureOutputAndError(captured):
-        ray.get(f.remote())
-        time.sleep(1)
+    capsys.readouterr()
+    ray.get(f.remote())
+    time.sleep(1)
 
-    output_lines = captured["out"]
-    assert len(output_lines) == 0
-
-    err_lines = captured["err"]
-    assert len(err_lines) == 0
+    out, err = capsys.readouterr()
+    assert len(out) == 0
+    assert len(err) == 0
 
 
 def test_workers(shutdown_only):
@@ -196,51 +175,60 @@ def test_wait_reconstruction(shutdown_only):
     assert len(ready_ids) == 1
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="Windows doesn't support changing process title."
+)
 def test_ray_setproctitle(ray_start_2_cpus):
     @ray.remote
     class UniqueName:
         def __init__(self):
-            assert setproctitle.getproctitle() == "ray::UniqueName.__init__"
+            assert psutil.Process().cmdline()[0] == "ray::UniqueName.__init__"
 
         def f(self):
-            assert setproctitle.getproctitle() == "ray::UniqueName.f"
+            assert psutil.Process().cmdline()[0] == "ray::UniqueName.f"
 
     @ray.remote
     def unique_1():
-        assert "unique_1" in setproctitle.getproctitle()
+        assert psutil.Process().cmdline()[0] == "ray::unique_1"
 
     actor = UniqueName.remote()
     ray.get(actor.f.remote())
     ray.get(unique_1.remote())
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="Windows doesn't support changing process title."
+)
 def test_ray_task_name_setproctitle(ray_start_2_cpus):
     method_task_name = "foo"
 
     @ray.remote
     class UniqueName:
         def __init__(self):
-            assert setproctitle.getproctitle() == "ray::UniqueName.__init__"
+            assert psutil.Process().cmdline()[0] == "ray::UniqueName.__init__"
 
         def f(self):
-            assert setproctitle.getproctitle() == f"ray::{method_task_name}"
+            assert psutil.Process().cmdline()[0] == f"ray::{method_task_name}"
 
     task_name = "bar"
 
     @ray.remote
     def unique_1():
-        assert task_name in setproctitle.getproctitle()
+        assert psutil.Process().cmdline()[0] == f"ray::{task_name}"
 
     actor = UniqueName.remote()
     ray.get(actor.f.options(name=method_task_name).remote())
     ray.get(unique_1.options(name=task_name).remote())
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="Windows doesn't support changing process title."
+)
 def test_ray_task_generator_setproctitle(ray_start_2_cpus):
     @ray.remote
     def generator_task():
         for i in range(4):
-            assert setproctitle.getproctitle() == "ray::generator_task"
+            assert psutil.Process().cmdline()[0] == "ray::generator_task"
             yield i
 
     ray.get(generator_task.options(num_returns=2).remote()[0])
@@ -253,7 +241,7 @@ def test_ray_task_generator_setproctitle(ray_start_2_cpus):
     class UniqueName:
         def f(self):
             for i in range(4):
-                assert setproctitle.getproctitle() == "ray::UniqueName.f"
+                assert psutil.Process().cmdline()[0] == "ray::UniqueName.f"
                 yield i
 
     actor = UniqueName.remote()
@@ -262,6 +250,83 @@ def test_ray_task_generator_setproctitle(ray_start_2_cpus):
     generator = actor.f.remote()
     for _ in range(4):
         ray.get(next(generator))
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason=(
+        "Test specifically targets the Linux /proc/self/stat fallback in "
+        "src/ray/thirdparty/setproctitle/spt_setup.c."
+    ),
+)
+def test_setproctitle_falls_back_to_proc_stat_when_environ_broken(tmp_path):
+    """Regression test for the vendored-setproctitle deflake.
+
+    spt_setup() in src/ray/thirdparty/setproctitle/spt_setup.c originally
+    relied on find_argv_from_env(), which walks backward from environ[0] to
+    locate the original argv memory region. That walk silently fails once
+    libc setenv()/putenv() has moved environ, leaving every subsequent
+    setproctitle() call as a no-op. We added find_argv_from_proc_stat() as
+    a fallback that reads the kernel-recorded arg_start/arg_end from
+    /proc/self/stat (set at execve() time, immune to env mutation).
+
+    This test deliberately clears os.environ in a subprocess BEFORE the
+    first setproctitle() call. Without the fallback, env[0] is NULL,
+    find_argv_from_env() fails, and the title write is silently dropped.
+    With the fallback in place, the kernel-recorded bounds are used and
+    /proc/self/cmdline reflects the new title.
+    """
+    import subprocess
+    import textwrap
+
+    marker = "ray::PROC_STAT_FALLBACK_OK"
+    script = textwrap.dedent(
+        f"""
+        import os, sys
+        # Import _raylet BEFORE wiping environ — the .so load itself may
+        # need a sane environment, and spt_setup() is lazy (only fires on
+        # the first setproctitle() call), so we can safely break environ
+        # afterwards.
+        import ray._raylet
+
+        # Break find_argv_from_env(): environ[0] becomes NULL once cleared,
+        # so the backward walk bails out immediately.
+        os.environ.clear()
+
+        ray._raylet.setproctitle({marker!r})
+
+        with open("/proc/self/cmdline", "rb") as f:
+            cmdline = f.read()
+        # /proc/self/cmdline is NUL-separated; the title is written into
+        # argv[0]'s buffer and padded with NULs.
+        first_arg = cmdline.split(b"\\x00", 1)[0].decode("utf-8", "replace")
+        print("FIRST_ARG=" + first_arg)
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert (
+        result.returncode == 0
+    ), f"subprocess failed: stdout={result.stdout!r} stderr={result.stderr!r}"
+    # Locate our marker line in stdout (other Ray imports may emit chatter).
+    first_arg_lines = [
+        line for line in result.stdout.splitlines() if line.startswith("FIRST_ARG=")
+    ]
+    assert first_arg_lines, (
+        f"FIRST_ARG line missing from subprocess output. "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    first_arg = first_arg_lines[-1][len("FIRST_ARG=") :]
+    assert first_arg == marker, (
+        f"setproctitle did not take effect after os.environ.clear(): "
+        f"expected {marker!r}, got {first_arg!r}. "
+        f"This typically means the /proc/self/stat fallback in "
+        f"src/ray/thirdparty/setproctitle/spt_setup.c regressed."
+    )
 
 
 @pytest.mark.skipif(
@@ -286,7 +351,7 @@ def test_ray_stack(ray_start_2_cpus):
     start_time = time.time()
     while time.time() - start_time < 30:
         # Attempt to parse the "ray stack" call.
-        output = ray._private.utils.decode(
+        output = ray._common.utils.decode(
             check_call_ray(["stack"], capture_stdout=True)
         )
         if (
@@ -375,9 +440,4 @@ def test_decorated_function(ray_start_regular):
 
 
 if __name__ == "__main__":
-    import pytest
-
-    if os.environ.get("PARALLEL_CI"):
-        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
-    else:
-        sys.exit(pytest.main(["-sv", __file__]))
+    sys.exit(pytest.main(["-sv", __file__]))

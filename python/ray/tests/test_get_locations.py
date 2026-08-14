@@ -1,3 +1,4 @@
+import sys
 import time
 
 import numpy as np
@@ -5,7 +6,6 @@ import pandas as pd
 import pytest
 
 import ray
-from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 
 def test_uninitialized():
@@ -16,15 +16,6 @@ def test_uninitialized():
 def test_get_locations_empty_list(ray_start_regular):
     locations = ray.experimental.get_object_locations([])
     assert len(locations) == 0
-
-
-def test_get_locations_timeout(ray_start_regular):
-    sizes = [100, 1000]
-    obj_refs = [ray.put(np.zeros(s, dtype=np.uint8)) for s in sizes]
-    ray.wait(obj_refs)
-    timeout_ms = 0
-    with pytest.raises(ray.exceptions.GetTimeoutError):
-        ray.experimental.get_object_locations(obj_refs, timeout_ms)
 
 
 def test_get_locations(ray_start_regular):
@@ -146,11 +137,12 @@ def test_location_pending(ray_start_cluster):
 # sys.getsizeof. The caller then asserts the object size from the API
 # `ray.experimental.get_local_object_locations` is > the actual memory consumed.
 
+BIG_OBJ_SIZE = 3 * 1024 * 1024  # 3 MiB
+
 
 class BigObject:
     def __init__(self):
-        # 100 MiB of memory used...
-        self.data = np.zeros((100 * 1024 * 1024), dtype=np.uint8)
+        self.data = np.zeros((BIG_OBJ_SIZE,), dtype=np.uint8)
 
 
 @ray.remote
@@ -179,8 +171,8 @@ def test_get_local_locations(ray_start_regular):
     """
     obj_ref = gen_big_object.remote(3)
     ray.wait([obj_ref])
-    # The dataframe consists of 3 * 100MiB of NumPy NDArrays.
-    assert_object_size_gt(obj_ref, 3 * 100 * 1024 * 1024)
+    # The dataframe consists of 3 MiB of NumPy NDArrays.
+    assert_object_size_gt(obj_ref, BIG_OBJ_SIZE)
 
 
 def test_get_local_locations_generator(ray_start_regular):
@@ -190,8 +182,8 @@ def test_get_local_locations_generator(ray_start_regular):
     """
     for obj_ref in gen_big_objects.remote(3, 10):
         # No need to ray.wait, the object ref must have been ready before it's yielded.
-        # The dataframe consists of 3 * 100MiB of NumPy NDArrays.
-        assert_object_size_gt(obj_ref, 3 * 100 * 1024 * 1024)
+        # The dataframe consists of 3 MiB of NumPy NDArrays.
+        assert_object_size_gt(obj_ref, BIG_OBJ_SIZE)
 
 
 def test_get_local_locations_multi_nodes(ray_start_cluster):
@@ -212,19 +204,15 @@ def test_get_local_locations_multi_nodes(ray_start_cluster):
     @ray.remote
     def caller():
         obj_ref = gen_big_object.options(
-            scheduling_strategy=NodeAffinitySchedulingStrategy(
-                node_id=worker_node_id, soft=False
-            )
+            label_selector={ray._raylet.RAY_NODE_ID_KEY: worker_node_id}
         ).remote(3)
         ray.wait([obj_ref])
-        # The dataframe consists of 3 * 100MiB of NumPy NDArrays.
-        assert_object_size_gt(obj_ref, 3 * 100 * 1024 * 1024)
+        # The dataframe consists of 3 MiB of NumPy NDArrays.
+        assert_object_size_gt(obj_ref, BIG_OBJ_SIZE)
 
     ray.get(
         caller.options(
-            scheduling_strategy=NodeAffinitySchedulingStrategy(
-                node_id=head_node_id, soft=False
-            )
+            label_selector={ray._raylet.RAY_NODE_ID_KEY: head_node_id}
         ).remote()
     )
 
@@ -247,29 +235,19 @@ def test_get_local_locations_generator_multi_nodes(ray_start_cluster):
     @ray.remote
     def caller():
         gen = gen_big_objects.options(
-            scheduling_strategy=NodeAffinitySchedulingStrategy(
-                node_id=worker_node_id, soft=False
-            )
+            label_selector={ray._raylet.RAY_NODE_ID_KEY: worker_node_id}
         ).remote(3, 10)
         for obj_ref in gen:
             # No need to ray.wait, the object ref must have been ready before it's
             # yielded.
-            assert_object_size_gt(obj_ref, 3 * 100 * 1024 * 1024)
+            assert_object_size_gt(obj_ref, BIG_OBJ_SIZE)
 
     ray.get(
         caller.options(
-            scheduling_strategy=NodeAffinitySchedulingStrategy(
-                node_id=head_node_id, soft=False
-            )
+            label_selector={ray._raylet.RAY_NODE_ID_KEY: head_node_id}
         ).remote()
     )
 
 
 if __name__ == "__main__":
-    import sys
-    import os
-
-    if os.environ.get("PARALLEL_CI"):
-        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
-    else:
-        sys.exit(pytest.main(["-sv", __file__]))
+    sys.exit(pytest.main(["-sv", __file__]))

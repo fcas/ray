@@ -1,46 +1,167 @@
 import asyncio
+import collections
 import copy
+import errno
 import importlib
 import inspect
 import logging
-import os
 import random
-import string
+import re
 import time
-import traceback
 import uuid
-from abc import ABC, abstractmethod
+import zlib
 from decimal import ROUND_HALF_UP, Decimal
 from enum import Enum
 from functools import wraps
-from typing import Any, Callable, Dict, List, Optional, TypeVar, Union
+from typing import Any, Callable, Dict, List, Optional, Set, TypeVar, Union, cast
 
-import requests
+import requests  # type: ignore[import-untyped]
 
 import ray
 import ray.util.serialization_addons
-from ray._private.resource_spec import HEAD_NODE_RESOURCE_NAME
-from ray._private.utils import import_attr
-from ray._private.worker import LOCAL_MODE, SCRIPT_MODE
-from ray._raylet import MessagePackSerializer
+from ray import cloudpickle
+from ray._common.constants import HEAD_NODE_RESOURCE_NAME
+from ray._common.utils import get_random_alphanumeric_string, import_attr
+from ray._raylet import MessagePackSerializer  # type: ignore[attr-defined]
 from ray.actor import ActorHandle
-from ray.exceptions import RayTaskError
-from ray.serve._private.common import ServeComponentType
-from ray.serve._private.constants import HTTP_PROXY_TIMEOUT, SERVE_LOGGER_NAME
+from ray.serve._private.common import DeploymentID, RequestMetadata, ServeComponentType
+from ray.serve._private.constants import (
+    HTTP_PROXY_TIMEOUT,
+    SERVE_DEPLOYMENT_ACTOR_PREFIX,
+    SERVE_LOGGER_NAME,
+    SERVE_NAMESPACE,
+)
 from ray.types import ObjectRef
 from ray.util.serialization import StandaloneSerializationContext
 
 try:
     import pandas as pd
 except ImportError:
-    pd = None
+    pd = cast(Any, None)
 
 try:
     import numpy as np
 except ImportError:
-    np = None
+    np = cast(Any, None)
+
+FILE_NAME_REGEX = r"[^\x20-\x7E]|[<>:\"/\\|?*]"
 
 MESSAGE_PACK_OFFSET = 9
+
+# Attribute set on functions/methods decorated with `@serve.multiplexed`. The
+# `__serve_multiplex_wrapper` is only created lazily on the first call, so this
+# marker is used to detect multiplexing statically (e.g. at replica startup)
+# without invoking user code.
+MULTIPLEXED_FUNCTION_MARKER_ATTR = "_serve_multiplexed_function"
+
+
+def _callable_uses_multiplexing(callable_obj: Any) -> bool:
+    """Whether `callable_obj` is or defines an `@serve.multiplexed` function.
+
+    Accepts a standalone function, a class, or a class instance, so it can be used
+    both at build time (where the deployment's `func_or_class` is available) and at
+    runtime (where an initialized instance is available).
+
+    For an instance it also inspects instance attributes, so multiplexing that is
+    wired up dynamically at init time (e.g. ``self._load_model =
+    serve.multiplexed(...)(fn)``) is detected. This case can only be caught at
+    runtime, since it is not visible on the class statically.
+    """
+    # Static: a plain `getattr` on a `DeploymentHandle` runs `__getattr__`, which
+    # eagerly initializes its Router. `is True` guards against truthy impostors.
+    def _has_marker(obj: Any) -> bool:
+        try:
+            return (
+                inspect.getattr_static(obj, MULTIPLEXED_FUNCTION_MARKER_ATTR, False)
+                is True
+            )
+        except Exception:
+            return False
+
+    # Standalone function deployment decorated with `@serve.multiplexed`.
+    if _has_marker(callable_obj):
+        return True
+
+    # A class (or instance of one) with a method decorated with `@serve.multiplexed`.
+    klass = callable_obj if isinstance(callable_obj, type) else type(callable_obj)
+    for base in klass.__mro__:
+        for attr in base.__dict__.values():
+            if _has_marker(attr):
+                return True
+
+    # An instance that stored a multiplexed wrapper as an instance attribute.
+    if not isinstance(callable_obj, type):
+        # `getattr` falls back to `__getattr__` on a `__slots__` class;
+        # `getattr_static` returns the descriptor rather than the instance mapping.
+        try:
+            instance_vars = object.__getattribute__(callable_obj, "__dict__")
+        except AttributeError:
+            instance_vars = {}
+        for attr in instance_vars.values():
+            if _has_marker(attr):
+                return True
+
+    return False
+
+
+def asyncio_grpc_exception_handler(loop, context):
+    """Exception handler to filter out false positive BlockingIOErrors from gRPC."""
+    exc = context.get("exception")
+    msg = context.get("message")
+    if (
+        exc
+        and isinstance(exc, BlockingIOError)
+        and exc.errno == errno.EAGAIN
+        and "PollerCompletionQueue._handle_events" in msg
+    ):
+        return
+
+    loop.default_exception_handler(context)
+
+
+def validate_ssl_config(
+    ssl_certfile: Optional[str], ssl_keyfile: Optional[str]
+) -> None:
+    """Validate SSL configuration for HTTPS support.
+
+    Args:
+        ssl_certfile: Path to SSL certificate file
+        ssl_keyfile: Path to SSL private key file
+
+    Raises:
+        ValueError: If only one of ssl_certfile or ssl_keyfile is provided
+    """
+    if (ssl_certfile and not ssl_keyfile) or (ssl_keyfile and not ssl_certfile):
+        raise ValueError(
+            "Both ssl_keyfile and ssl_certfile must be provided together "
+            "to enable HTTPS."
+        )
+
+
+def get_deployment_actor_name(
+    deployment_id: DeploymentID,
+    actor_name: str,
+    code_version: str,
+) -> str:
+    """Return the deterministic Ray actor name for a deployment-scoped actor.
+
+    The name is versioned by code_version to allow old and new replicas to
+    coexist during rollout (each uses its version's actors). Actors serve as
+    central state for replicas, so we version by code_version to ensure fresh
+    actors when a new code version is deployed.
+    """
+    base = (
+        f"{SERVE_DEPLOYMENT_ACTOR_PREFIX}{deployment_id.app_name}"
+        f"::{deployment_id.name}"
+    )
+    return f"{base}::{code_version}::{actor_name}"
+
+
+GENERATOR_COMPOSITION_NOT_SUPPORTED_ERROR = RuntimeError(
+    "Streaming deployment handle results cannot be passed to "
+    "downstream handle calls. If you have a use case requiring "
+    "this feature, please file a feature request on GitHub."
+)
 
 
 # Use a global singleton enum to emulate default options. We cannot use None
@@ -137,12 +258,8 @@ def block_until_http_ready(
         time.sleep(backoff_time_s)
 
 
-# Match the standard alphabet used for UUIDs.
-RANDOM_STRING_ALPHABET = string.ascii_lowercase + string.digits
-
-
-def get_random_string(length=8):
-    return "".join(random.choices(RANDOM_STRING_ALPHABET, k=length))
+def get_random_string(length: int = 8):
+    return get_random_alphanumeric_string(length)
 
 
 def format_actor_name(actor_name, *modifiers):
@@ -153,22 +270,59 @@ def format_actor_name(actor_name, *modifiers):
     return name
 
 
+CLASS_WRAPPER_METADATA_ATTRS = (
+    "__name__",
+    "__qualname__",
+    "__module__",
+    "__doc__",
+    "__annotations__",
+)
+
+
+def copy_class_metadata(wrapper_cls, target_cls) -> None:
+    """Copy common class-level metadata onto a wrapper class."""
+    for attr in CLASS_WRAPPER_METADATA_ATTRS:
+        if attr == "__annotations__":
+            target_annotations = getattr(target_cls, "__annotations__", None)
+            if target_annotations:
+                merged_annotations = dict(
+                    wrapper_cls.__dict__.get("__annotations__", {})
+                )
+                for key, value in target_annotations.items():
+                    merged_annotations.setdefault(key, value)
+                wrapper_cls.__annotations__ = merged_annotations
+            continue
+
+        if hasattr(target_cls, attr):
+            setattr(wrapper_cls, attr, getattr(target_cls, attr))
+    wrapper_cls.__wrapped__ = target_cls
+
+
+def _register_thread_lock_serializer(serialization_context):
+    """Make threading locks cloudpickle-serializable.
+
+    FastAPI >= 0.137 embeds a threading.Lock in the ASGI app object, which cloudpickle
+    cannot serialize ("cannot pickle '_thread.lock' object"). serve.ingress(app) pickles
+    the app to freeze it (and again to ship it to replicas), so both fail. A lock carries
+    no transferable state and the app is frozen/shipped before it serves any request, so
+    reconstruct a fresh, unlocked lock on deserialization.
+    """
+    import threading
+
+    for lock_factory in (threading.Lock, threading.RLock):
+        serialization_context._register_cloudpickle_serializer(
+            type(lock_factory()),
+            custom_serializer=lambda lock: None,
+            custom_deserializer=lambda _serialized, factory=lock_factory: factory(),
+        )
+
+
 def ensure_serialization_context():
     """Ensure the serialization addons on registered, even when Ray has not
     been started."""
     ctx = StandaloneSerializationContext()
     ray.util.serialization_addons.apply(ctx)
-
-
-def wrap_to_ray_error(function_name: str, exception: Exception) -> RayTaskError:
-    """Utility method to wrap exceptions in user code."""
-
-    try:
-        # Raise and catch so we can access traceback.format_exc()
-        raise exception
-    except Exception as e:
-        traceback_str = ray._private.utils.format_error_message(traceback.format_exc())
-        return ray.exceptions.RayTaskError(function_name, traceback_str, e)
+    _register_thread_lock_serializer(ctx)
 
 
 def msgpack_serialize(obj):
@@ -238,7 +392,8 @@ def override_runtime_envs_except_env_vars(parent_env: Dict, child_env: Dict) -> 
         parent_env: The environment to inherit settings from.
         child_env: The environment with override settings.
 
-    Returns: A new dictionary containing the merged runtime_env settings.
+    Returns:
+        A new dictionary containing the merged runtime_env settings.
 
     Raises:
         TypeError: If a dictionary is not passed in for parent_env or child_env.
@@ -297,6 +452,13 @@ def require_packages(packages: List[str]):
         >>> func() # doctest: +SKIP
         ImportError: func requires ["numpy", "package_a"] but
         ["package_a"] are not available, please pip install them.
+
+    Args:
+        packages: The list of package names that must be importable when the
+            decorated function is invoked.
+
+    Returns:
+        A decorator that wraps the target function with the package check.
     """
 
     def decorator(func):
@@ -315,7 +477,7 @@ def require_packages(packages: List[str]):
                         "`pip install` them or add them to "
                         "`runtime_env`."
                     )
-                setattr(func, "_require_packages_checked", True)
+                func._require_packages_checked = True
 
         if inspect.iscoroutinefunction(func):
 
@@ -347,20 +509,6 @@ def in_interactive_shell():
     return not hasattr(main, "__file__")
 
 
-def guarded_deprecation_warning(*args, **kwargs):
-    """Wrapper for deprecation warnings, guarded by a flag."""
-    if os.environ.get("SERVE_WARN_V1_DEPRECATIONS", "0") == "1":
-        from ray._private.utils import deprecated
-
-        return deprecated(*args, **kwargs)
-    else:
-
-        def noop_decorator(func):
-            return func
-
-        return noop_decorator
-
-
 def snake_to_camel_case(snake_str: str) -> str:
     """Convert a snake case string to camel case."""
 
@@ -374,6 +522,19 @@ def check_obj_ref_ready_nowait(obj_ref: ObjectRef) -> bool:
     return len(finished) == 1
 
 
+def compress_metric_report(report: Any) -> bytes:
+    """Compress a metric report (HandleMetricReport or ReplicaMetricReport) for RPC.
+
+    Uses zlib level 9 (stdlib, no extra deps). ~75KB uncompressed -> ~5KB for 1000 replicas.
+    """
+    return zlib.compress(cloudpickle.dumps(report), level=9)
+
+
+def decompress_metric_report(compressed: bytes) -> Any:
+    """Decompress a metric report from RPC."""
+    return cloudpickle.loads(zlib.decompress(compressed))
+
+
 def extract_self_if_method_call(args: List[Any], func: Callable) -> Optional[object]:
     """Check if this is a method rather than a function.
 
@@ -382,11 +543,12 @@ def extract_self_if_method_call(args: List[Any], func: Callable) -> Optional[obj
     robust solution to this I was able to find. It would also be preferable
     to do this check when the decorator runs, rather than when the method is.
 
-    Returns the `self` object if it's a method call, else None.
-
     Arguments:
         args: arguments to the function/method call.
         func: the unbound function that was called.
+
+    Returns:
+        The ``self`` object if it's a method call, else ``None``.
     """
     if len(args) > 0:
         method = getattr(args[0], func.__name__, False)
@@ -480,6 +642,35 @@ def get_all_live_placement_group_names() -> List[str]:
     return live_pg_names
 
 
+def get_active_placement_group_ids() -> Set[str]:
+    """
+    Retrieve the set of placement group IDs referenced by alive Serve actors.
+
+    Returns:
+        The set of placement group IDs referenced by alive Serve actors.
+    """
+    # TODO (jeffreywang): Move the imports to the top of the file.
+    # https://github.com/ray-project/ray/issues/61330
+    from ray.util.state import list_actors
+    from ray.util.state.common import RAY_MAX_LIMIT_FROM_API_SERVER
+
+    actors = list_actors(
+        filters=[
+            ("ray_namespace", "=", SERVE_NAMESPACE),
+            ("state", "=", "ALIVE"),
+        ],
+        limit=RAY_MAX_LIMIT_FROM_API_SERVER,
+        detail=True,
+        raise_on_missing_output=False,
+    )
+
+    return {
+        actor.placement_group_id
+        for actor in actors
+        if actor.placement_group_id is not None
+    }
+
+
 def get_current_actor_id() -> str:
     """Gets the ID of the calling actor.
 
@@ -492,7 +683,7 @@ def get_current_actor_id() -> str:
     """
 
     worker_mode = ray.get_runtime_context().worker.mode
-    if worker_mode in {SCRIPT_MODE, LOCAL_MODE}:
+    if worker_mode == ray.SCRIPT_MODE:
         return "DRIVER"
     else:
         try:
@@ -511,18 +702,6 @@ def is_running_in_asyncio_loop() -> bool:
         return True
     except RuntimeError:
         return False
-
-
-class TimerBase(ABC):
-    @abstractmethod
-    def time(self) -> float:
-        """Return the current time."""
-        raise NotImplementedError
-
-
-class Timer(TimerBase):
-    def time(self) -> float:
-        return time.time()
 
 
 def get_capacity_adjusted_num_replicas(
@@ -550,7 +729,11 @@ def get_capacity_adjusted_num_replicas(
 
 
 def generate_request_id() -> str:
-    return str(uuid.uuid4())
+    # NOTE(edoakes): we use random.getrandbits because it reduces CPU overhead
+    # significantly. This is less cryptographically secure but should be ok for
+    # request ID generation.
+    # See https://bugs.python.org/issue45556 for discussion.
+    return str(uuid.UUID(int=random.getrandbits(128), version=4))
 
 
 def inside_ray_client_context() -> bool:
@@ -563,7 +746,8 @@ def get_component_file_name(
     component_type: Optional[ServeComponentType],
     suffix: str = "",
 ) -> str:
-    """Get the component's file name."""
+    """Get the component's file name. Replaces special characters with underscores."""
+    component_name = re.sub(FILE_NAME_REGEX, "_", component_name)
 
     # For DEPLOYMENT component type, we want to log the deployment name
     # instead of adding the component type to the component name.
@@ -580,26 +764,158 @@ def get_component_file_name(
     return file_name
 
 
-class FakeObjectRefOrGen:
-    def __init__(self, replica_id):
-        self._replica_id = replica_id
+def validate_route_prefix(route_prefix: Union[DEFAULT, None, str]):
+    if route_prefix is DEFAULT.VALUE or route_prefix is None:
+        return
 
-    @property
-    def replica_id(self):
-        return self._replica_id
+    if not route_prefix.startswith("/"):
+        raise ValueError(
+            f"Invalid route_prefix '{route_prefix}', "
+            "must start with a forward slash ('/')."
+        )
+
+    if route_prefix != "/" and route_prefix.endswith("/"):
+        raise ValueError(
+            f"Invalid route_prefix '{route_prefix}', "
+            "may not end with a trailing '/'."
+        )
+
+    if "{" in route_prefix or "}" in route_prefix:
+        raise ValueError(
+            f"Invalid route_prefix '{route_prefix}', may not contain wildcards."
+        )
 
 
-class FakeObjectRef(FakeObjectRefOrGen):
-    def __await__(self):
-        raise NotImplementedError
-
-    def _on_completed(self, callback: Callable):
-        pass
+async def await_deployment_response(deployment_response):
+    return await deployment_response
 
 
-class FakeObjectRefGen(FakeObjectRefOrGen):
-    def __anext__(self):
-        raise NotImplementedError
+async def resolve_deployment_response(obj: Any, request_metadata: RequestMetadata):
+    """Resolve `DeploymentResponse` objects to underlying object references.
 
-    def completed(self):
-        return FakeObjectRef(self._replica_id)
+    This enables composition without explicitly calling `_to_object_ref`.
+    """
+    from ray.serve.handle import DeploymentResponse, DeploymentResponseGenerator
+
+    if isinstance(obj, DeploymentResponseGenerator):
+        raise GENERATOR_COMPOSITION_NOT_SUPPORTED_ERROR
+    elif isinstance(obj, DeploymentResponse):
+        if request_metadata._by_reference and obj.by_reference:
+            # If sending requests by reference, launch async task to
+            # convert DeploymentResponse to an object ref
+            return asyncio.create_task(obj._to_object_ref())
+        else:
+            # Otherwise, resolve DeploymentResponse directly to result
+            return asyncio.create_task(await_deployment_response(obj))
+    elif not request_metadata._by_reference and isinstance(obj, ray.ObjectRef):
+        # If the router is sending requests by value (i.e. using gRPC),
+        # resolve all Ray objects to mirror Ray behavior
+        return asyncio.wrap_future(obj.future())
+
+
+def wait_for_interrupt() -> None:
+    try:
+        while True:
+            # Block, letting Ray print logs to the terminal.
+            time.sleep(10)
+    except KeyboardInterrupt:
+        logger.warning("Got KeyboardInterrupt, exiting...")
+        # We need to re-raise KeyboardInterrupt, so serve components can be shutdown
+        # from the main script.
+        raise
+
+
+def is_grpc_enabled(grpc_config) -> bool:
+    return grpc_config.port > 0 and len(grpc_config.grpc_servicer_functions) > 0
+
+
+class Semaphore:
+    """Based on asyncio.Semaphore.
+
+    This is a semaphore that can be used to limit the number of concurrent requests.
+    Its maximum value is dynamic and is determined by the `get_value_fn` function.
+    """
+
+    def __init__(self, get_value_fn: Callable[[], int]):
+        self._waiters = None
+        self._value = 0
+        self._get_value_fn = get_value_fn
+
+    def __repr__(self):
+        res = super().__repr__()
+        extra = "locked" if self.locked() else f"unlocked, value:{self._value}"
+        if self._waiters:
+            extra = f"{extra}, waiters:{len(self._waiters)}"
+        return f"<{res[1:-1]} [{extra}]>"
+
+    async def __aenter__(self):
+        await self.acquire()
+        # We have no use for the "as ..."  clause in the with
+        # statement for locks.
+        return None
+
+    async def __aexit__(self, exc_type, exc, tb):
+        self.release()
+
+    def get_max_value(self):
+        return self._get_value_fn()
+
+    def locked(self):
+        """Returns True if semaphore cannot be acquired immediately."""
+        return self._value >= self.get_max_value() or (
+            any(not w.cancelled() for w in (self._waiters or ()))
+        )
+
+    async def acquire(self):
+        """Acquire a semaphore.
+        If the internal counter is larger than zero on entry,
+        decrement it by one and return True immediately.  If it is
+        zero on entry, block, waiting until some other coroutine has
+        called release() to make it larger than 0, and then return
+        True.
+        """
+        if not self.locked():
+            self._value += 1
+            return True
+
+        if self._waiters is None:
+            self._waiters = collections.deque()
+        fut = asyncio.Future()
+        self._waiters.append(fut)
+
+        # Finally block should be called before the CancelledError
+        # handling as we don't want CancelledError to call
+        # _wake_up_first() and attempt to wake up itself.
+        try:
+            try:
+                await fut
+            finally:
+                self._waiters.remove(fut)
+        except asyncio.CancelledError:
+            if not fut.cancelled():
+                self._value -= 1
+                self._wake_up_next()
+            raise
+
+        if self._value < self.get_max_value():
+            self._wake_up_next()
+        return True
+
+    def release(self):
+        """Release a semaphore, incrementing the internal counter by one.
+        When it was zero on entry and another coroutine is waiting for it to
+        become larger than zero again, wake up that coroutine.
+        """
+        self._value -= 1
+        self._wake_up_next()
+
+    def _wake_up_next(self):
+        """Wake up the first waiter that isn't done."""
+        if not self._waiters:
+            return
+
+        for fut in self._waiters:
+            if not fut.done():
+                self._value += 1
+                fut.set_result(True)
+                return

@@ -3,8 +3,8 @@ import tempfile
 import time
 from typing import Any, List, Optional
 
+import httpx
 import pytest
-import requests
 import starlette.responses
 from fastapi import (
     APIRouter,
@@ -16,6 +16,7 @@ from fastapi import (
     Query,
     Request,
     Response,
+    params as fastapi_params,
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -25,12 +26,17 @@ from starlette.routing import Route
 
 import ray
 from ray import serve
-from ray._private.test_utils import SignalActor, wait_for_condition
+from ray._common.test_utils import SignalActor, wait_for_condition
 from ray.exceptions import GetTimeoutError
 from ray.serve._private.client import ServeControllerClient
-from ray.serve._private.constants import SERVE_DEFAULT_APP_NAME
-from ray.serve._private.http_util import make_fastapi_class_based_view
-from ray.serve._private.utils import DEFAULT
+from ray.serve._private.constants import (
+    SERVE_DEFAULT_APP_NAME,
+)
+from ray.serve._private.http_util import (
+    _walk_fastapi_routes,
+    make_fastapi_class_based_view,
+)
+from ray.serve._private.test_utils import get_application_url
 from ray.serve.exceptions import RayServeException
 from ray.serve.handle import DeploymentHandle
 
@@ -49,10 +55,12 @@ def test_fastapi_function(serve_instance):
 
     serve.run(FastAPIApp.bind())
 
-    resp = requests.get("http://localhost:8000/100")
+    url = get_application_url("HTTP")
+
+    resp = httpx.get(f"{url}/100")
     assert resp.json() == {"result": 100}
 
-    resp = requests.get("http://localhost:8000/not-number")
+    resp = httpx.get(f"{url}/not-number")
     assert resp.status_code == 422  # Unprocessable Entity
     # Pydantic 1.X returns `type_error.integer`, 2.X returns `int_parsing`.
     assert resp.json()["detail"][0]["type"] in {"type_error.integer", "int_parsing"}
@@ -72,7 +80,8 @@ def test_ingress_prefix(serve_instance):
 
     serve.run(App.bind(), route_prefix="/api")
 
-    resp = requests.get("http://localhost:8000/api/100")
+    url = get_application_url("HTTP")
+    resp = httpx.get(f"{url}/100")
     assert resp.json() == {"result": 100}
 
 
@@ -103,11 +112,12 @@ def test_class_based_view(serve_instance):
     serve.run(A.bind())
 
     # Test HTTP calls.
-    resp = requests.get("http://localhost:8000/calc/41")
+    url = get_application_url("HTTP")
+    resp = httpx.get(f"{url}/calc/41")
     assert resp.json() == 42
-    resp = requests.post("http://localhost:8000/calc/41")
+    resp = httpx.post(f"{url}/calc/41")
     assert resp.json() == 40
-    resp = requests.get("http://localhost:8000/other")
+    resp = httpx.get(f"{url}/other")
     assert resp.json() == "hello"
 
     # Test handle calls.
@@ -117,39 +127,65 @@ def test_class_based_view(serve_instance):
     assert handle.other.remote("world").result() == "world"
 
 
+def _find_route(app, endpoint):
+    """Return the route whose endpoint is ``endpoint``, searching nested routers.
+
+    FastAPI >= 0.137 nests routes registered via ``include_router`` under
+    ``_IncludedRouter`` nodes, so we can't rely on flat ``app.routes`` indexing.
+    """
+    for route, _parent, _prefix in _walk_fastapi_routes(app):
+        if route.endpoint == endpoint:
+            return route
+    raise AssertionError(f"route for {endpoint} not found")
+
+
 @pytest.mark.parametrize("websocket", [False, True])
-def test_make_fastapi_class_based_view(websocket: bool):
+@pytest.mark.parametrize("via_router", [False, True])
+def test_make_fastapi_class_based_view(websocket: bool, via_router: bool):
     app = FastAPI()
+    router = APIRouter(prefix="/prefix")
+    # When `via_router` is set, register the endpoint through `include_router`.
+    # On FastAPI >= 0.137 such routes are nested under an `_IncludedRouter`,
+    # which previously hid them from the class-based-view transform (#64475).
+    target = router if via_router else app
 
     if websocket:
 
         class A:
-            @app.get("/{i}")
+            @target.websocket("/{i}")
             def b(self, i: int):
                 pass
 
     else:
 
         class A:
-            @app.websocket("/{i}")
+            @target.get("/{i}")
             def b(self, i: int):
                 pass
 
-    # before, "self" is treated as a query params
-    assert app.routes[-1].endpoint == A.b
-    assert app.routes[-1].dependant.query_params[0].name == "self"
-    assert len(app.routes[-1].dependant.dependencies) == 0
+    if via_router:
+        app.include_router(router)
+
+    # before, "self" is treated as a query param.
+    route = _find_route(app, A.b)
+    assert route.dependant.query_params[0].name == "self"
+    assert len(route.dependant.dependencies) == 0
 
     make_fastapi_class_based_view(app, A)
 
-    # after, "self" is treated as a dependency instead of query params
-    assert app.routes[-1].endpoint == A.b
-    assert len(app.routes[-1].dependant.query_params) == 0
-    assert len(app.routes[-1].dependant.dependencies) == 1
-    self_dep = app.routes[-1].dependant.dependencies[0]
-    assert self_dep.name == "self"
-    assert inspect.isfunction(self_dep.call)
-    assert "get_current_servable" in str(self_dep.call)
+    # After the transform "self" is injected via a dependency. We assert on the
+    # endpoint signature (which the transform rewrites directly) rather than on
+    # `route.dependant`: FastAPI >= 0.137 recomputes the dependant lazily at
+    # request time for routes registered via `include_router`, so the route
+    # object's cached `dependant` may still reflect the pre-transform signature.
+    params = list(inspect.signature(A.b).parameters.values())
+    assert params[0].name == "self"
+    assert isinstance(params[0].default, fastapi_params.Depends)
+    assert "get_current_servable" in str(params[0].default.dependency)
+    # Remaining params become keyword-only since `self` is no longer positional.
+    assert all(p.kind == inspect.Parameter.KEYWORD_ONLY for p in params[1:]), [
+        (p.name, p.kind) for p in params[1:]
+    ]
 
 
 class Nested(BaseModel):
@@ -258,27 +294,31 @@ def test_fastapi_features(serve_instance):
 
     serve.run(Worker.bind())
 
-    url = "http://localhost:8000"
-    resp = requests.get(f"{url}/")
+    url = get_application_url("HTTP")
+    resp = httpx.get(f"{url}/")
     assert resp.status_code == 404
     assert "x-process-time" in resp.headers
 
-    resp = requests.get(f"{url}/my_api.json")
+    resp = httpx.get(f"{url}/my_api.json")
     assert resp.status_code == 200
     assert resp.json()  # it returns a well-formed json.
 
-    resp = requests.get(f"{url}/docs")
+    resp = httpx.get(f"{url}/docs")
     assert resp.status_code == 200
     assert "<!DOCTYPE html>" in resp.text
 
-    resp = requests.get(f"{url}/redoc")
+    resp = httpx.get(f"{url}/redoc")
     assert resp.status_code == 200
     assert "<!DOCTYPE html>" in resp.text
 
-    resp = requests.get(f"{url}/path_arg")
+    resp = httpx.get(f"{url}/path_arg")
     assert resp.status_code == 422  # Malformed input
 
-    resp = requests.get(
+    # Including a body in a GET request is against HTTP/1.1
+    # spec (RFC 7231) and is discouraged, even though some
+    # servers/libraries may accept it.
+    resp = httpx.request(
+        "GET",
         f"{url}/path_arg",
         json={"name": "serve", "price": 12, "nests": {"val": 1}},
         params={
@@ -297,14 +337,18 @@ def test_fastapi_features(serve_instance):
         False,
         "at-least-three-chars",
         None,
-        "python-requests",
+        "python-httpx",
         {"q": "common_arg"},
         "db",
         "app.state",
     ]
-    assert open(resp.json()["file_path"]).read() == "hello"
+    wait_for_condition(
+        lambda: open(resp.json()["file_path"]).read() == "hello",
+        timeout=10,
+    )
 
-    resp = requests.get(
+    resp = httpx.request(
+        "GET",
         f"{url}/path_arg",
         json={"name": "serve", "price": 12, "nests": {"val": 1}},
         params={
@@ -317,10 +361,10 @@ def test_fastapi_features(serve_instance):
     assert resp.status_code == 500
     assert resp.json()["custom_error"] == "true"
 
-    resp = requests.get(f"{url}/prefix/subpath")
+    resp = httpx.get(f"{url}/prefix/subpath")
     assert resp.status_code == 200
 
-    resp = requests.get(
+    resp = httpx.get(
         f"{url}/docs",
         headers={
             "Access-Control-Request-Method": "GET",
@@ -347,7 +391,8 @@ def test_fast_api_mounted_app(serve_instance):
 
     serve.run(A.bind(), route_prefix="/api")
 
-    assert requests.get("http://localhost:8000/api/mounted/hi").json() == "world"
+    url = get_application_url("HTTP")
+    assert httpx.get(f"{url}/mounted/hi").json() == "world"
 
 
 def test_fastapi_init_lifespan_should_not_shutdown(serve_instance):
@@ -355,7 +400,7 @@ def test_fastapi_init_lifespan_should_not_shutdown(serve_instance):
 
     @app.on_event("shutdown")
     async def shutdown():
-        1 / 0
+        _ = 1 / 0
 
     @serve.deployment
     @serve.ingress(app)
@@ -409,15 +454,17 @@ def test_fastapi_duplicate_routes(serve_instance):
 
     serve.run(App1.bind(), name="app1", route_prefix="/api/v1")
     serve.run(App2.bind(), name="app2", route_prefix="/api/v2")
+    app1_url = get_application_url("HTTP", app_name="app1")
+    app2_url = get_application_url("HTTP", app_name="app2")
 
-    resp = requests.get("http://localhost:8000/api/v1")
+    resp = httpx.get(app1_url, follow_redirects=True)
     assert resp.json() == "first"
 
-    resp = requests.get("http://localhost:8000/api/v2")
+    resp = httpx.get(app2_url, follow_redirects=True)
     assert resp.json() == "second"
 
-    for version in ["v1", "v2"]:
-        resp = requests.get(f"http://localhost:8000/api/{version}/ignored")
+    for version in [app1_url, app2_url]:
+        resp = httpx.get(f"{version}/ignored")
         assert resp.status_code == 404
 
 
@@ -434,13 +481,14 @@ def test_asgi_compatible(serve_instance):
 
     serve.run(MyApp.bind())
 
-    resp = requests.get("http://localhost:8000/")
+    url = get_application_url("HTTP")
+    resp = httpx.get(url)
     assert resp.json() == {"hello": "world"}
 
 
 @pytest.mark.parametrize(
     "input_route_prefix,expected_route_prefix",
-    [(DEFAULT.VALUE, "/"), ("/", "/"), ("/subpath", "/subpath/")],
+    [("/", "/"), ("/subpath", "/subpath/")],
 )
 def test_doc_generation(serve_instance, input_route_prefix, expected_route_prefix):
     app = FastAPI()
@@ -454,14 +502,16 @@ def test_doc_generation(serve_instance, input_route_prefix, expected_route_prefi
 
     serve.run(App.bind(), route_prefix=input_route_prefix)
 
-    r = requests.get(f"http://localhost:8000{expected_route_prefix}openapi.json")
+    url = get_application_url("HTTP")
+    assert expected_route_prefix.rstrip("/") in url
+    r = httpx.get(f"{url}/openapi.json")
     assert r.status_code == 200
     assert len(r.json()["paths"]) == 1
     assert "/" in r.json()["paths"]
     assert len(r.json()["paths"]["/"]) == 1
     assert "get" in r.json()["paths"]["/"]
 
-    r = requests.get(f"http://localhost:8000{expected_route_prefix}docs")
+    r = httpx.get(f"{url}/docs")
     assert r.status_code == 200
 
     @serve.deployment
@@ -477,7 +527,9 @@ def test_doc_generation(serve_instance, input_route_prefix, expected_route_prefi
 
     serve.run(App.bind(), route_prefix=input_route_prefix)
 
-    r = requests.get(f"http://localhost:8000{expected_route_prefix}openapi.json")
+    url = get_application_url("HTTP")
+    assert expected_route_prefix.rstrip("/") in url
+    r = httpx.get(f"{url}/openapi.json")
     assert r.status_code == 200
     assert len(r.json()["paths"]) == 2
     assert "/" in r.json()["paths"]
@@ -487,7 +539,7 @@ def test_doc_generation(serve_instance, input_route_prefix, expected_route_prefi
     assert len(r.json()["paths"]["/hello"]) == 1
     assert "post" in r.json()["paths"]["/hello"]
 
-    r = requests.get(f"http://localhost:8000{expected_route_prefix}docs")
+    r = httpx.get(f"{url}/docs")
     assert r.status_code == 200
 
 
@@ -508,8 +560,9 @@ def test_fastapi_multiple_headers(serve_instance):
 
     serve.run(FastAPIApp.bind())
 
-    resp = requests.get("http://localhost:8000/")
-    assert resp.cookies.get_dict() == {"a": "b", "c": "d"}
+    url = get_application_url("HTTP")
+    resp = httpx.get(url)
+    assert dict(resp.cookies) == {"a": "b", "c": "d"}
 
 
 class TestModel(BaseModel):
@@ -544,13 +597,14 @@ def test_fastapi_nested_field_in_response_model(serve_instance):
 
     serve.run(TestDeployment.bind())
 
-    resp = requests.get("http://localhost:8000/")
+    url = get_application_url("HTTP")
+    resp = httpx.get(url)
     assert resp.json() == {"a": "a", "b": ["b"]}
 
-    resp = requests.get("http://localhost:8000/inner")
+    resp = httpx.get(f"{url}/inner")
     assert resp.json() == {"a": "a", "b": ["b"]}
 
-    resp = requests.get("http://localhost:8000/inner2")
+    resp = httpx.get(f"{url}/inner2")
     assert resp.json() == [{"a": "a", "b": ["b"]}]
 
 
@@ -585,7 +639,8 @@ def test_fastapiwrapper_constructor_before_startup_hooks(serve_instance):
             return self.test_passed
 
     serve.run(TestDeployment.bind())
-    resp = requests.get("http://localhost:8000/")
+    url = get_application_url("HTTP")
+    resp = httpx.get(url)
     assert resp.json()
 
 
@@ -650,8 +705,9 @@ def test_fastapi_method_redefinition(serve_instance):
             return "hi post"
 
     serve.run(A.bind(), route_prefix="/a")
-    assert requests.get("http://localhost:8000/a/").json() == "hi get"
-    assert requests.post("http://localhost:8000/a/").json() == "hi post"
+    url = get_application_url("HTTP")
+    assert httpx.get(f"{url}/").json() == "hi get"
+    assert httpx.post(f"{url}/").json() == "hi post"
 
 
 def test_fastapi_same_app_multiple_deployments(serve_instance):
@@ -683,35 +739,39 @@ def test_fastapi_same_app_multiple_deployments(serve_instance):
     serve.run(CounterDeployment1.bind(), name="app1", route_prefix="/app1")
     serve.run(CounterDeployment2.bind(), name="app2", route_prefix="/app2")
 
+    app1_url = get_application_url("HTTP", app_name="app1")
+    app2_url = get_application_url("HTTP", app_name="app2")
+
     should_work = [
-        ("/app1/incr", "incr"),
-        ("/app1/decr", "decr"),
-        ("/app2/incr2", "incr2"),
-        ("/app2/decr2", "decr2"),
+        (app1_url, "/incr", "incr"),
+        (app1_url, "/decr", "decr"),
+        (app2_url, "/incr2", "incr2"),
+        (app2_url, "/decr2", "decr2"),
     ]
-    for path, resp in should_work:
-        assert requests.get("http://localhost:8000" + path).json() == resp, (path, resp)
+    for url, path, resp in should_work:
+        assert httpx.get(f"{url}{path}").json() == resp, (path, resp)
 
     should_404 = [
-        "/app2/incr",
-        "/app2/decr",
-        "/app1/incr2",
-        "/app1/decr2",
+        (app1_url, "/incr2", 404),
+        (app1_url, "/decr2", 404),
+        (app2_url, "/incr", 404),
+        (app2_url, "/decr", 404),
     ]
-    for path in should_404:
-        assert requests.get("http://localhost:8000" + path).status_code == 404, path
+    for url, path, status_code in should_404:
+        assert httpx.get(f"{url}{path}").status_code == status_code, (path, status_code)
 
 
 @pytest.mark.parametrize("two_fastapi", [True, False])
+@pytest.mark.parametrize("docs_url", ["/docs", None])
 def test_two_fastapi_in_one_application(
-    serve_instance: ServeControllerClient, two_fastapi
+    serve_instance: ServeControllerClient, two_fastapi, docs_url
 ):
     """
     Check that a deployment graph that would normally work, will not deploy
     successfully if there are two FastAPI deployments.
     """
-    app1 = FastAPI()
-    app2 = FastAPI()
+    app1 = FastAPI(docs_url=docs_url)
+    app2 = FastAPI(docs_url=docs_url)
 
     class SubModel:
         def add(self, a: int):
@@ -767,6 +827,499 @@ def test_fastapi_docs_path(
         lambda: ray.get(serve_instance._controller.get_docs_path.remote("app1"))
         == docs_path
     )
+
+
+def fastapi_builder():
+    app = FastAPI(docs_url="/custom-docs")
+
+    @app.get("/")
+    def f1():
+        return "hello"
+
+    router = APIRouter()
+
+    @router.get("/f2")
+    def f2():
+        return "hello f2"
+
+    @router.get("/error")
+    def error():
+        raise ValueError("some error")
+
+    app.include_router(router)
+
+    # add a middleware
+    @app.middleware("http")
+    async def add_process_time_header(request: Request, call_next):
+        response = await call_next(request)
+        response.headers["X-Custom-Middleware"] = "fake-middleware"
+        return response
+
+    # custom exception handler
+    @app.exception_handler(ValueError)
+    async def custom_exception_handler(request: Request, exc: ValueError):
+        return JSONResponse(status_code=500, content={"error": "fake-error"})
+
+    return app
+
+
+def test_ingress_with_fastapi_routes_outside_deployment(serve_instance):
+    app = fastapi_builder()
+
+    @serve.deployment
+    @serve.ingress(app)
+    class ASGIIngress:
+        @app.get("/class_route")
+        def class_route(self):
+            return "hello class route"
+
+    serve.run(ASGIIngress.bind())
+    url = get_application_url("HTTP")
+    assert httpx.get(url).json() == "hello"
+    assert httpx.get(f"{url}/f2").json() == "hello f2"
+    assert httpx.get(f"{url}/class_route").json() == "hello class route"
+    assert httpx.get(f"{url}/error").status_code == 500
+    assert httpx.get(f"{url}/error").json() == {"error": "fake-error"}
+
+    # get the docs path from the controller
+    docs_path = ray.get(serve_instance._controller.get_docs_path.remote("default"))
+    assert docs_path == "/custom-docs"
+
+
+def test_ingress_with_fastapi_with_no_deployment_class(serve_instance):
+    app = fastapi_builder()
+
+    ingress_deployment = serve.deployment(serve.ingress(app)())
+    assert ingress_deployment.name == "ASGIIngressDeployment"
+    serve.run(ingress_deployment.bind())
+    url = get_application_url("HTTP")
+    assert httpx.get(url).json() == "hello"
+    assert httpx.get(f"{url}/f2").json() == "hello f2"
+    assert httpx.get(f"{url}/error").status_code == 500
+    assert httpx.get(f"{url}/error").json() == {"error": "fake-error"}
+
+    # get the docs path from the controller
+    docs_path = ray.get(serve_instance._controller.get_docs_path.remote("default"))
+    assert docs_path == "/custom-docs"
+
+
+def test_ingress_with_fastapi_builder_function(serve_instance):
+    ingress_deployment = serve.deployment(serve.ingress(fastapi_builder)())
+    serve.run(ingress_deployment.bind())
+
+    url = get_application_url("HTTP")
+    resp = httpx.get(url)
+    assert resp.json() == "hello"
+    assert resp.headers["X-Custom-Middleware"] == "fake-middleware"
+
+    resp = httpx.get(f"{url}/f2")
+    assert resp.json() == "hello f2"
+    assert resp.headers["X-Custom-Middleware"] == "fake-middleware"
+
+    resp = httpx.get(f"{url}/error")
+    assert resp.status_code == 500
+    assert resp.json() == {"error": "fake-error"}
+
+    docs_path = ray.get(serve_instance._controller.get_docs_path.remote("default"))
+    assert docs_path == "/custom-docs"
+
+
+def test_ingress_with_fastapi_builder_with_deployment_class(serve_instance):
+    @serve.deployment
+    @serve.ingress(fastapi_builder)
+    class ASGIIngress:
+        def __init__(self):
+            pass
+
+    serve.run(ASGIIngress.bind())
+
+    url = get_application_url("HTTP")
+    resp = httpx.get(url)
+    assert resp.json() == "hello"
+
+    resp = httpx.get(f"{url}/f2")
+    assert resp.json() == "hello f2"
+
+    resp = httpx.get(f"{url}/error")
+    assert resp.status_code == 500
+    assert resp.json() == {"error": "fake-error"}
+
+    # get the docs path from the controller
+    docs_path = ray.get(serve_instance._controller.get_docs_path.remote("default"))
+    assert docs_path == "/custom-docs"
+
+
+def test_ingress_with_fastapi_with_native_deployment(serve_instance):
+    app = fastapi_builder()
+
+    class ASGIIngress:
+        def __call__(self):
+            pass
+
+    with pytest.raises(ValueError) as e:
+        serve.ingress(app)(ASGIIngress)
+    assert "Classes passed to @serve.ingress may not have __call__ method." in str(
+        e.value
+    )
+
+
+def sub_deployment():
+    @serve.deployment
+    class SubModel:
+        def __call__(self, a: int):
+            return a + 1
+
+    return SubModel.options(name="sub_deployment")
+
+
+def fastapi_builder_with_sub_deployment():
+    app = fastapi_builder()
+
+    def get_sub_deployment_handle():
+        return serve.get_deployment_handle(sub_deployment().name, "default")
+
+    class Data(BaseModel):
+        a: int
+
+    @app.get("/sub_deployment", response_model=Data)
+    async def f(
+        request: Request, handle: DeploymentHandle = Depends(get_sub_deployment_handle)
+    ):
+        a = int(request.query_params.get("a", 1))
+        result = await handle.remote(a)
+        return Data(a=result)
+
+    return app
+
+
+def test_deployment_composition_with_builder_function(serve_instance):
+    @serve.deployment
+    @serve.ingress(fastapi_builder_with_sub_deployment)
+    class ASGIIngress:
+        def __init__(self, sub_deployment: DeploymentHandle):
+            self.sub_deployment = sub_deployment
+
+    serve.run(ASGIIngress.bind(sub_deployment().bind()))
+
+    url = get_application_url("HTTP")
+    resp = httpx.get(f"{url}/sub_deployment?a=2")
+    assert resp.json() == {"a": 3}
+
+
+def test_deployment_composition_with_builder_function_without_decorator(serve_instance):
+    app = serve.deployment(serve.ingress(fastapi_builder_with_sub_deployment)())
+
+    # the default ingress deployment returned from serve.ingress accepts args and kwargs
+    # and passes them to the deployment constructor
+    serve.run(app.bind(sub_deployment().bind()))
+
+    url = get_application_url("HTTP")
+    resp = httpx.get(f"{url}/sub_deployment?a=2")
+    assert resp.json() == {"a": 3}
+
+
+def starlette_builder():
+    from starlette.applications import Starlette
+    from starlette.middleware import Middleware
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.responses import JSONResponse
+    from starlette.routing import Route, Router
+
+    # Define route handlers
+    async def homepage(request):
+        return JSONResponse("hello")
+
+    async def f2(request):
+        return JSONResponse("hello f2")
+
+    async def error(request):
+        raise ValueError("some error")
+
+    # Create a router for additional routes
+    router = Router(
+        [
+            Route("/f2", f2),
+            Route("/error", error),
+        ]
+    )
+
+    # Create a middleware for adding headers
+    class CustomHeaderMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request, call_next):
+            response = await call_next(request)
+            response.headers["X-Custom-Middleware"] = "fake-middleware"
+            return response
+
+    # Custom exception handler for ValueError
+    def handle_value_error(request, exc):
+        return JSONResponse(status_code=500, content={"error": "fake-error"})
+
+    exception_handlers = {ValueError: handle_value_error}
+
+    # Configure routes for the main app
+    routes = [
+        Route("/", homepage),
+    ]
+
+    # Create the Starlette app with middleware and exception handlers
+    app = Starlette(
+        routes=routes,
+        middleware=[Middleware(CustomHeaderMiddleware)],
+        exception_handlers=exception_handlers,
+    )
+
+    # Mount the router to the main app
+    app.mount("/", router)
+
+    return app
+
+
+def test_ingress_with_starlette_app_with_no_deployment_class(serve_instance):
+    ingress_deployment = serve.deployment(serve.ingress(starlette_builder())())
+    serve.run(ingress_deployment.bind())
+
+    url = get_application_url("HTTP")
+    resp = httpx.get(url)
+    assert resp.json() == "hello"
+    assert resp.headers["X-Custom-Middleware"] == "fake-middleware"
+
+    resp = httpx.get(f"{url}/f2")
+    assert resp.json() == "hello f2"
+    assert resp.headers["X-Custom-Middleware"] == "fake-middleware"
+
+    resp = httpx.get(f"{url}/error")
+    assert resp.status_code == 500
+    assert resp.json() == {"error": "fake-error"}
+
+    docs_path = ray.get(serve_instance._controller.get_docs_path.remote("default"))
+    assert docs_path is None
+
+
+def test_ingress_with_starlette_builder_with_no_deployment_class(serve_instance):
+    ingress_deployment = serve.deployment(serve.ingress(starlette_builder)())
+    serve.run(ingress_deployment.bind())
+
+    url = get_application_url("HTTP")
+    resp = httpx.get(url)
+    assert resp.json() == "hello"
+    assert resp.headers["X-Custom-Middleware"] == "fake-middleware"
+
+    resp = httpx.get(f"{url}/f2")
+    assert resp.json() == "hello f2"
+    assert resp.headers["X-Custom-Middleware"] == "fake-middleware"
+
+    resp = httpx.get(f"{url}/error")
+    assert resp.status_code == 500
+    assert resp.json() == {"error": "fake-error"}
+
+    docs_path = ray.get(serve_instance._controller.get_docs_path.remote("default"))
+    assert docs_path is None
+
+
+def test_ingress_with_starlette_builder_with_deployment_class(serve_instance):
+    @serve.deployment
+    @serve.ingress(starlette_builder)
+    class ASGIIngress:
+        def __init__(self):
+            pass
+
+    serve.run(ASGIIngress.bind())
+
+    url = get_application_url("HTTP")
+    resp = httpx.get(url)
+    assert resp.json() == "hello"
+    assert resp.headers["X-Custom-Middleware"] == "fake-middleware"
+
+    resp = httpx.get(f"{url}/f2")
+    assert resp.json() == "hello f2"
+    assert resp.headers["X-Custom-Middleware"] == "fake-middleware"
+
+    resp = httpx.get(f"{url}/error")
+    assert resp.status_code == 500
+    assert resp.json() == {"error": "fake-error"}
+
+    docs_path = ray.get(serve_instance._controller.get_docs_path.remote("default"))
+    assert docs_path is None
+
+
+def test_ingress_multi_level_inheritance(serve_instance):
+    """Test multi-level inheritance works correctly with serve.ingress.
+
+    Tests: Grandparent -> Parent -> Child -> ServedIngress
+
+    This tests the fix in make_fastapi_class_based_view that properly handles
+    inherited methods by checking the MRO instead of just the immediate class.
+
+    Without the fix, inherited endpoints would fail with:
+    'Field required at ('query', 'self')'
+
+    Also tests that unrelated classes whose names CONTAIN an MRO class name
+    as a substring don't cause false positives. For example, if MRO contains
+    "Child", an unrelated class "ChildExtra" should not have its routes matched
+    because "Child" in "ChildExtra.method" would be True with substring matching.
+    This validates that the matching uses prefix matching with a dot delimiter.
+    """
+    app = FastAPI()
+
+    class Grandparent:
+        @app.get("/grandparent")
+        def grandparent_endpoint(self):
+            return {"level": "grandparent"}
+
+    class Parent(Grandparent):
+        @app.get("/parent")
+        def parent_endpoint(self):
+            return {"level": "parent"}
+
+    class Child(Parent):
+        @app.get("/child")
+        def child_endpoint(self):
+            return {"level": "child"}
+
+    # Unrelated class whose name CONTAINS "Child" (an MRO class) as a substring.
+    # With substring matching, "Child" in "ChildExtra.extra_endpoint" would be
+    # True, causing incorrect self injection into this unrelated route.
+    class ChildExtra:
+        @app.get("/extra")
+        def extra_endpoint(self):
+            # This should NOT have self injection since ChildExtra is not in MRO
+            return {"level": "extra"}
+
+    @serve.deployment
+    @serve.ingress(app)
+    class ServedIngress(Child):
+        pass
+
+    serve.run(ServedIngress.bind())
+
+    url = get_application_url("HTTP")
+
+    # Test all inherited endpoints
+    resp = httpx.get(f"{url}/grandparent")
+    assert resp.status_code == 200, f"Grandparent failed: {resp.text}"
+    assert resp.json() == {"level": "grandparent"}
+
+    resp = httpx.get(f"{url}/parent")
+    assert resp.status_code == 200, f"Parent failed: {resp.text}"
+    assert resp.json() == {"level": "parent"}
+
+    resp = httpx.get(f"{url}/child")
+    assert resp.status_code == 200, f"Child failed: {resp.text}"
+    assert resp.json() == {"level": "child"}
+
+    # Test that the unrelated ChildExtra route is NOT processed.
+    # With substring matching bug, "Child" in "ChildExtra.extra_endpoint" would
+    # be True, incorrectly applying self injection and making this route work.
+    # With the fix, the route is correctly excluded from processing, so `self`
+    # is not injected. FastAPI then treats `self` as a required query parameter,
+    # which fails with 422 (unprocessable entity).
+    resp = httpx.get(f"{url}/extra")
+    assert resp.status_code == 422, f"Expected 422 for unprocessed route: {resp.text}"
+
+
+def test_ingress_direct_inheritance(serve_instance):
+    """Test direct inheritance works correctly with serve.ingress.
+
+    Tests: BaseIngress -> DirectServedIngress (with own endpoint)
+
+    This tests the fix in make_fastapi_class_based_view that properly handles
+    inherited methods by checking the MRO instead of just the immediate class.
+
+    Without the fix, inherited endpoints would fail with:
+    'Field required at ('query', 'self')'
+    """
+    app = FastAPI()
+
+    class BaseIngress:
+        @app.get("/base")
+        def base_endpoint(self):
+            return {"level": "base"}
+
+    @serve.deployment
+    @serve.ingress(app)
+    class DirectServedIngress(BaseIngress):
+        @app.get("/direct")
+        def direct_endpoint(self):
+            return {"level": "direct"}
+
+    serve.run(DirectServedIngress.bind())
+
+    url = get_application_url("HTTP")
+
+    # Test both inherited and own endpoints
+    resp = httpx.get(f"{url}/base")
+    assert resp.status_code == 200, f"Base failed: {resp.text}"
+    assert resp.json() == {"level": "base"}
+
+    resp = httpx.get(f"{url}/direct")
+    assert resp.status_code == 200, f"Direct failed: {resp.text}"
+    assert resp.json() == {"level": "direct"}
+
+
+def test_ingress_include_router_with_self(serve_instance):
+    """Endpoints registered via ``include_router`` must strip ``self`` (#64475).
+
+    FastAPI >= 0.137 nests routes added through ``include_router`` under an
+    ``_IncludedRouter`` node instead of flattening them into ``app.routes``.
+    The class-based-view transform previously only scanned the flat list, so
+    ``self`` was left in the signature and treated as a required query param,
+    causing requests to fail with 'Field required at ('query', 'self')' (422).
+    """
+    app = FastAPI()
+    # A router whose prefix is baked into the route path via `APIRouter(prefix=)`.
+    router = APIRouter(prefix="/prefix")
+    # A router whose prefix is supplied at `include_router(..., prefix=)` time.
+    # On FastAPI >= 0.137 this prefix lives on the `_IncludedRouter` node rather
+    # than in the route's own path, so the transform must fold it back in when
+    # re-mounting the route (otherwise the endpoint moves to the wrong path).
+    prefixed_router = APIRouter()
+
+    class Ingress:
+        @router.get("/routed")
+        def routed_endpoint(self, name: str = "world"):
+            return {"source": "router", "name": name}
+
+        @prefixed_router.get("/models/{model_id}")
+        def prefixed_endpoint(self, model_id: str):
+            return {"source": "prefixed", "model_id": model_id}
+
+        @app.get("/direct")
+        def direct_endpoint(self):
+            return {"source": "app"}
+
+    # Registered before the class is wrapped by `serve.ingress`, mirroring how
+    # applications (e.g. vLLM) compose their routers.
+    app.include_router(router)
+    app.include_router(prefixed_router, prefix="/api")
+
+    @serve.deployment
+    @serve.ingress(app)
+    class ServedIngress(Ingress):
+        pass
+
+    serve.run(ServedIngress.bind())
+
+    url = get_application_url("HTTP")
+
+    # The included route must resolve without a bogus `self` query param.
+    resp = httpx.get(f"{url}/prefix/routed")
+    assert resp.status_code == 200, f"Routed failed: {resp.text}"
+    assert resp.json() == {"source": "router", "name": "world"}
+
+    # Regular query params on the included route still work.
+    resp = httpx.get(f"{url}/prefix/routed", params={"name": "serve"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"source": "router", "name": "serve"}
+
+    # An include-time prefix must be preserved (route stays at /api/...).
+    resp = httpx.get(f"{url}/api/models/gpt")
+    assert resp.status_code == 200, f"Prefixed failed: {resp.text}"
+    assert resp.json() == {"source": "prefixed", "model_id": "gpt"}
+
+    # Directly decorated routes keep working too.
+    resp = httpx.get(f"{url}/direct")
+    assert resp.status_code == 200, f"Direct failed: {resp.text}"
+    assert resp.json() == {"source": "app"}
 
 
 if __name__ == "__main__":

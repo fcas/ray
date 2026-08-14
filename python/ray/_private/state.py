@@ -1,25 +1,122 @@
 import json
 import logging
+import sys
 from collections import defaultdict
-from typing import Dict
+from threading import Lock
+from typing import Dict, List, Optional
 
-from ray._private.protobuf_compat import message_to_dict
+import requests
 
 import ray
+from ray._common.constants import HEAD_NODE_RESOURCE_NAME, NODE_ID_PREFIX
+from ray._common.utils import binary_to_hex, decode, hex_to_binary
+from ray._private import ray_constants
 from ray._private.client_mode_hook import client_mode_hook
-from ray._private.resource_spec import NODE_ID_PREFIX, HEAD_NODE_RESOURCE_NAME
+from ray._private.protobuf_compat import message_to_dict
 from ray._private.utils import (
-    binary_to_hex,
-    decode,
-    hex_to_binary,
     validate_actor_state_name,
 )
-from ray._raylet import GlobalStateAccessor
-from ray.core.generated import common_pb2
-from ray.core.generated import gcs_pb2
+from ray._raylet import GcsClientOptions, GlobalStateAccessor
+from ray.core.generated import autoscaler_pb2, common_pb2, gcs_pb2, gcs_service_pb2
 from ray.util.annotations import DeveloperAPI
 
 logger = logging.getLogger(__name__)
+
+# Timeout for the synchronous task-events query to the dashboard head.
+_DASHBOARD_HEAD_QUERY_TIMEOUT_S = 30
+# Dashboard-head route that answers task-events queries.
+_TASK_EVENTS_QUERY_PATH = "/api/task_events/query"
+# GcsStatus.code value for a successful reply.
+_GCS_STATUS_CODE_OK = 0
+# Read task events (for ray.timeline / profiling) from the dashboard head instead of GCS.
+_READ_TASK_EVENTS_FROM_DASHBOARD_HEAD = (
+    ray._config.enable_task_events_to_dashboard_head()
+)
+
+
+class TaskEventsHeadClient:
+    """Synchronous client for the dashboard-head task-events query endpoint.
+
+    Resolves and caches the endpoint address on first use, reuses one HTTP session, and
+    attaches the cluster auth token on every request, so repeated ``ray.timeline`` calls
+    don't re-resolve the address or reopen connections.
+    """
+
+    def __init__(self, accessor: GlobalStateAccessor):
+        self._accessor = accessor
+        self._session = requests.Session()
+        self._endpoint = None
+
+    def close(self):
+        """Close the underlying HTTP session and its connection pool."""
+        self._session.close()
+
+    def _get_endpoint(self) -> str:
+        if self._endpoint is None:
+            address = self._accessor.get_internal_kv(
+                ray_constants.KV_NAMESPACE_DASHBOARD,
+                ray_constants.DASHBOARD_ADDRESS.encode(),
+            )
+            if not address:
+                raise RuntimeError(
+                    "Could not find the dashboard address to read task events from the "
+                    "dashboard head. Is the dashboard running?"
+                )
+            address = address.decode()
+            if not address.startswith(("http://", "https://")):
+                address = f"http://{address}"
+            self._endpoint = f"{address}{_TASK_EVENTS_QUERY_PATH}"
+        return self._endpoint
+
+    def get_task_events(self, timeout: int) -> List["gcs_pb2.TaskEvents"]:
+        """Return all task events (as ``TaskEvents`` protos) from the head.
+
+        No ``limit`` is set, so the head returns everything in its store, matching the
+        unbounded GCS ``GetAllTaskEvents`` path this replaces.
+        """
+        from ray._private.authentication.http_token_authentication import (
+            format_authentication_http_error,
+            get_auth_headers_if_auth_enabled,
+        )
+
+        endpoint = self._get_endpoint()
+        request = gcs_service_pb2.GetTaskEventsRequest()
+        headers = {"Content-Type": "application/octet-stream"}
+        headers.update(get_auth_headers_if_auth_enabled(headers))
+        try:
+            response = self._session.post(
+                endpoint,
+                data=request.SerializeToString(),
+                headers=headers,
+                timeout=timeout,
+            )
+        except requests.RequestException as e:
+            # Any request failure may mean the head is unreachable or restarted at a new
+            # address; drop the cached endpoint so the next call re-resolves it. This is
+            # slightly conservative though.
+            self._endpoint = None
+            raise RuntimeError(
+                f"Failed to reach the dashboard head at {endpoint} to read task events. "
+                "Is the dashboard running?"
+            ) from e
+        if not (200 <= response.status_code < 300):
+            auth_error = format_authentication_http_error(
+                response.status_code, response.text
+            )
+            if auth_error:
+                raise RuntimeError(auth_error)
+            raise RuntimeError(
+                f"Failed to read task events from the dashboard head at {endpoint}: "
+                f"HTTP {response.status_code} {response.reason}."
+            )
+        reply = gcs_service_pb2.GetTaskEventsReply()
+        reply.ParseFromString(response.content)
+        if reply.status.code != _GCS_STATUS_CODE_OK:
+            raise RuntimeError(
+                "The dashboard head rejected the task-events query: "
+                f"{reply.status.message}"
+            )
+        return list(reply.events_by_task)
 
 
 class GlobalState:
@@ -34,34 +131,51 @@ class GlobalState:
         """Create a GlobalState object."""
         # Args used for lazy init of this object.
         self.gcs_options = None
-        self.global_state_accessor = None
+        self._global_state_accessor = None
+        self._init_lock = Lock()
+        self._task_events_head_client = None
 
-    def _check_connected(self):
-        """Ensure that the object has been initialized before it is used.
-
-        This lazily initializes clients needed for state accessors.
-
-        Raises:
-            RuntimeError: An exception is raised if ray.init() has not been
-                called yet.
+    def _connect_and_get_accessor(self) -> GlobalStateAccessor:
         """
-        if self.gcs_options is not None and self.global_state_accessor is None:
-            self._really_init_global_state()
+        This lazily initializes clients needed for state accessors and returns a connected global state accessor.
 
-        # _really_init_global_state should have set self.global_state_accessor
-        if self.global_state_accessor is None:
-            raise ray.exceptions.RaySystemError(
-                "Ray has not been started yet. You can start Ray with 'ray.init()'."
-            )
+        Returns:
+            GlobalStateAccessor: A connected global state accessor.
+        Raises:
+            RuntimeError: An exception is raised if ray.init() has not been called yet.
+        """
+        with self._init_lock:
+            if self._global_state_accessor is not None:
+                return self._global_state_accessor
+
+            if self.gcs_options is None:
+                raise ray.exceptions.RaySystemError(
+                    "Ray has not been started yet. Trying to use state API before ray.init() has been called."
+                )
+
+            self._global_state_accessor = GlobalStateAccessor(self.gcs_options)
+            connected = self._global_state_accessor.connect()
+            if not connected:
+                self._global_state_accessor = None
+                raise ray.exceptions.RaySystemError(
+                    "Failed to connect to GCS. Please check if the GCS server is running "
+                    "and if this node can connect to the head node."
+                )
+            return self._global_state_accessor
 
     def disconnect(self):
         """Disconnect global state from GCS."""
-        self.gcs_options = None
-        if self.global_state_accessor is not None:
-            self.global_state_accessor.disconnect()
-            self.global_state_accessor = None
+        with self._init_lock:
+            self.gcs_options = None
+            if self._global_state_accessor is not None:
+                self._global_state_accessor = None
+            # Drop the cached task-events client (closing its HTTP session) so it doesn't
+            # keep a stale accessor across a reconnect; the next call rebuilds it.
+            if self._task_events_head_client is not None:
+                self._task_events_head_client.close()
+                self._task_events_head_client = None
 
-    def _initialize_global_state(self, gcs_options):
+    def _initialize_global_state(self, gcs_options: GcsClientOptions):
         """Set args for lazily initialization of the GlobalState object.
 
         It's possible that certain keys in gcs kv may not have been fully
@@ -74,14 +188,14 @@ class GlobalState:
 
         # Save args for lazy init of global state. This avoids opening extra
         # gcs connections from each worker until needed.
-        self.gcs_options = gcs_options
-
-    def _really_init_global_state(self):
-        self.global_state_accessor = GlobalStateAccessor(self.gcs_options)
-        self.global_state_accessor.connect()
+        with self._init_lock:
+            self.gcs_options = gcs_options
 
     def actor_table(
-        self, actor_id: str, job_id: ray.JobID = None, actor_state_name: str = None
+        self,
+        actor_id: Optional[str],
+        job_id: Optional[ray.JobID] = None,
+        actor_state_name: Optional[str] = None,
     ):
         """Fetch and parse the actor table information for a single actor ID.
 
@@ -99,11 +213,11 @@ class GlobalState:
         Returns:
             Information from the actor table.
         """
-        self._check_connected()
+        accessor = self._connect_and_get_accessor()
 
         if actor_id is not None:
             actor_id = ray.ActorID(hex_to_binary(actor_id))
-            actor_info = self.global_state_accessor.get_actor_info(actor_id)
+            actor_info = accessor.get_actor_info(actor_id)
             if actor_info is None:
                 return {}
             else:
@@ -111,9 +225,7 @@ class GlobalState:
                 return self._gen_actor_info(actor_table_data)
         else:
             validate_actor_state_name(actor_state_name)
-            actor_table = self.global_state_accessor.get_actor_table(
-                job_id, actor_state_name
-            )
+            actor_table = accessor.get_actor_table(job_id, actor_state_name)
             results = {}
             for i in range(len(actor_table)):
                 actor_table_data = gcs_pb2.ActorTableData.FromString(actor_table[i])
@@ -123,8 +235,11 @@ class GlobalState:
 
             return results
 
-    def _gen_actor_info(self, actor_table_data):
+    def _gen_actor_info(self, actor_table_data: gcs_pb2.ActorTableData):
         """Parse actor table data.
+
+        Args:
+            actor_table_data: The ``ActorTableData`` proto for a single actor.
 
         Returns:
             Information from actor table.
@@ -138,12 +253,12 @@ class GlobalState:
             "Address": {
                 "IPAddress": actor_table_data.address.ip_address,
                 "Port": actor_table_data.address.port,
-                "NodeID": binary_to_hex(actor_table_data.address.raylet_id),
+                "NodeID": binary_to_hex(actor_table_data.address.node_id),
             },
             "OwnerAddress": {
                 "IPAddress": actor_table_data.owner_address.ip_address,
                 "Port": actor_table_data.owner_address.port,
-                "NodeID": binary_to_hex(actor_table_data.owner_address.raylet_id),
+                "NodeID": binary_to_hex(actor_table_data.owner_address.node_id),
             },
             "State": gcs_pb2.ActorTableData.ActorState.DESCRIPTOR.values_by_number[
                 actor_table_data.state
@@ -163,9 +278,9 @@ class GlobalState:
         Returns:
             Information about the node in the cluster.
         """
-        self._check_connected()
+        accessor = self._connect_and_get_accessor()
 
-        return self.global_state_accessor.get_node_table()
+        return accessor.get_node_table()
 
     def job_table(self):
         """Fetch and parse the gcs job table.
@@ -179,9 +294,11 @@ class GlobalState:
             - "StartTime" (UNIX timestamp of the start time of this job),
             - "StopTime" (UNIX timestamp of the stop time of this job, if any)
         """
-        self._check_connected()
+        accessor = self._connect_and_get_accessor()
 
-        job_table = self.global_state_accessor.get_job_table()
+        job_table = accessor.get_job_table(
+            skip_submission_job_info_field=True, skip_is_running_tasks_field=True
+        )
 
         results = []
         for i in range(len(job_table)):
@@ -205,9 +322,9 @@ class GlobalState:
         Returns:
             Next job id in the cluster.
         """
-        self._check_connected()
+        accessor = self._connect_and_get_accessor()
 
-        return ray.JobID.from_int(self.global_state_accessor.get_next_job_id())
+        return ray.JobID.from_int(accessor.get_next_job_id())
 
     def profile_events(self):
         """Retrieve and return task profiling events from GCS.
@@ -228,13 +345,9 @@ class GlobalState:
                 ]
             }
         """
-        self._check_connected()
-
         result = defaultdict(list)
-        task_events = self.global_state_accessor.get_task_events()
-        for i in range(len(task_events)):
-            event = gcs_pb2.TaskEvents.FromString(task_events[i])
-            profile = event.profile_events
+        for task_event in self._get_all_task_events():
+            profile = task_event.profile_events
             if not profile:
                 continue
 
@@ -261,10 +374,53 @@ class GlobalState:
 
         return dict(result)
 
-    def get_placement_group_by_name(self, placement_group_name, ray_namespace):
-        self._check_connected()
+    def _get_all_task_events(self) -> List["gcs_pb2.TaskEvents"]:
+        """Return all task events (as ``TaskEvents`` protos) for timeline/profiling.
 
-        placement_group_info = self.global_state_accessor.get_placement_group_by_name(
+        Reads from the dashboard head when the task-events-to-dashboard-head migration is
+        enabled, otherwise from GCS.
+        """
+        if _READ_TASK_EVENTS_FROM_DASHBOARD_HEAD:
+            return self._get_task_events_head_client().get_task_events(
+                _DASHBOARD_HEAD_QUERY_TIMEOUT_S
+            )
+        accessor = self._connect_and_get_accessor()
+        return [
+            gcs_pb2.TaskEvents.FromString(task_event)
+            for task_event in accessor.get_task_events()
+        ]
+
+    def _get_task_events_head_client(self) -> "TaskEventsHeadClient":
+        """Lazily build and cache the reusable dashboard-head task-events client."""
+        # Ensure we're connected, then read the accessor under the lock and build against
+        # that.
+        self._connect_and_get_accessor()
+        with self._init_lock:
+            accessor = self._global_state_accessor
+            if accessor is None:
+                # don't build the client against a None accessor
+                raise ray.exceptions.RaySystemError(
+                    "Ray was disconnected while reading task events; please retry."
+                )
+            if (
+                self._task_events_head_client is None
+                # if the accessor with client is diff from actual accessor
+                # build client with the new accessor
+                or self._task_events_head_client._accessor is not accessor
+            ):
+                # Close the stale client's HTTP session before replacing it.
+                if self._task_events_head_client is not None:
+                    self._task_events_head_client.close()
+                self._task_events_head_client = TaskEventsHeadClient(accessor)
+            # TODO(karticam): There might be an edgy race condition where accessor
+            #  could go invalid after returning the client. so client makes request
+            #  with an invalid accessor.
+            return self._task_events_head_client
+
+    def get_placement_group_by_name(self, placement_group_name, ray_namespace):
+        accessor = self._connect_and_get_accessor()
+
+        placement_group_info = accessor.get_placement_group_by_name(
             placement_group_name, ray_namespace
         )
         if placement_group_info is None:
@@ -276,15 +432,13 @@ class GlobalState:
             return self._gen_placement_group_info(placement_group_table_data)
 
     def placement_group_table(self, placement_group_id=None):
-        self._check_connected()
+        accessor = self._connect_and_get_accessor()
 
         if placement_group_id is not None:
             placement_group_id = ray.PlacementGroupID(
                 hex_to_binary(placement_group_id.hex())
             )
-            placement_group_info = self.global_state_accessor.get_placement_group_info(
-                placement_group_id
-            )
+            placement_group_info = accessor.get_placement_group_info(placement_group_id)
             if placement_group_info is None:
                 return {}
             else:
@@ -293,9 +447,7 @@ class GlobalState:
                 )
                 return self._gen_placement_group_info(placement_group_info)
         else:
-            placement_group_table = (
-                self.global_state_accessor.get_placement_group_table()
-            )
+            placement_group_table = accessor.get_placement_group_table()
             results = {}
             for placement_group_info in placement_group_table:
                 placement_group_table_data = gcs_pb2.PlacementGroupTableData.FromString(
@@ -317,6 +469,8 @@ class GlobalState:
         def get_state(state):
             if state == gcs_pb2.PlacementGroupTableData.PENDING:
                 return "PENDING"
+            elif state == gcs_pb2.PlacementGroupTableData.PREPARED:
+                return "PREPARED"
             elif state == gcs_pb2.PlacementGroupTableData.CREATED:
                 return "CREATED"
             elif state == gcs_pb2.PlacementGroupTableData.RESCHEDULING:
@@ -431,7 +585,7 @@ class GlobalState:
         "cq_build_attempt_failed",
     ]
 
-    def chrome_tracing_dump(self, filename=None):
+    def chrome_tracing_dump(self, filename: Optional[str] = None):
         """Return a list of profiling events that can viewed as a timeline.
 
         To view this information as a timeline, simply dump it as a json file
@@ -452,7 +606,7 @@ class GlobalState:
         # TODO(rkn): This should support viewing just a window of time or a
         # limited number of events.
 
-        self._check_connected()
+        self._connect_and_get_accessor()
 
         # Add a small delay to account for propagation delay of events to the GCS.
         # This should be harmless enough but prevents calls to timeline() from
@@ -517,11 +671,11 @@ class GlobalState:
         else:
             return all_events
 
-    def chrome_tracing_object_transfer_dump(self, filename=None):
+    def chrome_tracing_object_transfer_dump(self, filename: Optional[str] = None):
         """Return a list of transfer events that can viewed as a timeline.
 
         To view this information as a timeline, simply dump it as a json file
-        by passing in "filename" or using using json.dump, and then load go to
+        by passing in "filename" or using json.dump, and then load go to
         chrome://tracing in the Chrome web browser and load the dumped file.
         Make sure to enable "Flow events" in the "View Options" menu.
 
@@ -533,7 +687,7 @@ class GlobalState:
             If filename is not provided, this returns a list of profiling
                 events. Each profile event is a dictionary.
         """
-        self._check_connected()
+        self._connect_and_get_accessor()
 
         node_id_to_address = {}
         for node_info in self.node_table():
@@ -614,10 +768,10 @@ class GlobalState:
 
     def workers(self):
         """Get a dictionary mapping worker ID to worker information."""
-        self._check_connected()
+        accessor = self._connect_and_get_accessor()
 
         # Get all data in worker table
-        worker_table = self.global_state_accessor.get_worker_table()
+        worker_table = accessor.get_worker_table()
         workers_data = {}
         for i in range(len(worker_table)):
             worker_table_data = gcs_pb2.WorkerTableData.FromString(worker_table[i])
@@ -642,7 +796,9 @@ class GlobalState:
                     )
         return workers_data
 
-    def add_worker(self, worker_id, worker_type, worker_info):
+    def add_worker(
+        self, worker_id: bytes, worker_type: int, worker_info: Dict[str, str]
+    ):
         """Add a worker to the cluster.
 
         Args:
@@ -654,17 +810,17 @@ class GlobalState:
         Returns:
              Is operation success
         """
+        accessor = self._connect_and_get_accessor()
+
         worker_data = gcs_pb2.WorkerTableData()
         worker_data.is_alive = True
         worker_data.worker_address.worker_id = worker_id
         worker_data.worker_type = worker_type
         for k, v in worker_info.items():
             worker_data.worker_info[k] = bytes(v, encoding="utf-8")
-        return self.global_state_accessor.add_worker_info(
-            worker_data.SerializeToString()
-        )
+        return accessor.add_worker_info(worker_data.SerializeToString())
 
-    def update_worker_debugger_port(self, worker_id, debugger_port):
+    def update_worker_debugger_port(self, worker_id: bytes, debugger_port: int):
         """Update the debugger port of a worker.
 
         Args:
@@ -674,18 +830,16 @@ class GlobalState:
         Returns:
              Is operation success
         """
-        self._check_connected()
+        accessor = self._connect_and_get_accessor()
 
         assert worker_id is not None, "worker_id is not valid"
         assert (
             debugger_port is not None and debugger_port > 0
         ), "debugger_port is not valid"
 
-        return self.global_state_accessor.update_worker_debugger_port(
-            worker_id, debugger_port
-        )
+        return accessor.update_worker_debugger_port(worker_id, debugger_port)
 
-    def get_worker_debugger_port(self, worker_id):
+    def get_worker_debugger_port(self, worker_id: bytes):
         """Get the debugger port of a worker.
 
         Args:
@@ -694,13 +848,15 @@ class GlobalState:
         Returns:
              Debugger port of the worker.
         """
-        self._check_connected()
+        accessor = self._connect_and_get_accessor()
 
         assert worker_id is not None, "worker_id is not valid"
 
-        return self.global_state_accessor.get_worker_debugger_port(worker_id)
+        return accessor.get_worker_debugger_port(worker_id)
 
-    def update_worker_num_paused_threads(self, worker_id, num_paused_threads_delta):
+    def update_worker_num_paused_threads(
+        self, worker_id: bytes, num_paused_threads_delta: int
+    ):
         """Updates the number of paused threads of a worker.
 
         Args:
@@ -710,12 +866,12 @@ class GlobalState:
         Returns:
              Is operation success
         """
-        self._check_connected()
+        accessor = self._connect_and_get_accessor()
 
         assert worker_id is not None, "worker_id is not valid"
         assert num_paused_threads_delta is not None, "worker_id is not valid"
 
-        return self.global_state_accessor.update_worker_num_paused_threads(
+        return accessor.update_worker_num_paused_threads(
             worker_id, num_paused_threads_delta
         )
 
@@ -729,29 +885,26 @@ class GlobalState:
             A dictionary mapping resource name to the total quantity of that
                 resource in the cluster.
         """
-        self._check_connected()
+        self._connect_and_get_accessor()
 
-        resources = defaultdict(int)
-        nodes = self.node_table()
-        for node in nodes:
-            # Only count resources from latest entries of live nodes.
-            if node["Alive"]:
-                for key, value in node["Resources"].items():
-                    resources[key] += value
-        return dict(resources)
+        # Calculate total resources.
+        total_resources = defaultdict(int)
+        for node_total_resources in self.total_resources_per_node().values():
+            for resource_id, value in node_total_resources.items():
+                total_resources[resource_id] += value
+
+        return dict(total_resources)
 
     def _live_node_ids(self):
         """Returns a set of node IDs corresponding to nodes still alive."""
-        return {node["NodeID"] for node in self.node_table() if (node["Alive"])}
+        return set(self.total_resources_per_node().keys())
 
     def available_resources_per_node(self):
-        """Returns a dictionary mapping node id to avaiable resources."""
-        self._check_connected()
+        """Returns a dictionary mapping node id to available resources."""
+        accessor = self._connect_and_get_accessor()
         available_resources_by_id = {}
 
-        all_available_resources = (
-            self.global_state_accessor.get_all_available_resources()
-        )
+        all_available_resources = accessor.get_all_available_resources()
         for available_resource in all_available_resources:
             message = gcs_pb2.AvailableResources.FromString(available_resource)
             # Calculate available resources for this node.
@@ -759,10 +912,28 @@ class GlobalState:
             for resource_id, capacity in message.resources_available.items():
                 dynamic_resources[resource_id] = capacity
             # Update available resources for this node.
-            node_id = ray._private.utils.binary_to_hex(message.node_id)
+            node_id = ray._common.utils.binary_to_hex(message.node_id)
             available_resources_by_id[node_id] = dynamic_resources
 
         return available_resources_by_id
+
+    # returns a dict that maps node_id(hex string) to a dict of {resource_id: capacity}
+    def total_resources_per_node(self) -> Dict[str, Dict[str, int]]:
+        accessor = self._connect_and_get_accessor()
+        total_resources_by_node = {}
+
+        all_total_resources = accessor.get_all_total_resources()
+        for node_total_resources in all_total_resources:
+            message = gcs_pb2.TotalResources.FromString(node_total_resources)
+            # Calculate total resources for this node.
+            node_resources = {}
+            for resource_id, capacity in message.resources_total.items():
+                node_resources[resource_id] = capacity
+            # Update total resources for this node.
+            node_id = ray._common.utils.binary_to_hex(message.node_id)
+            total_resources_by_node[node_id] = node_resources
+
+        return total_resources_by_node
 
     def available_resources(self):
         """Get the current available cluster resources.
@@ -774,9 +945,11 @@ class GlobalState:
 
         Returns:
             A dictionary mapping resource name to the total quantity of that
-                resource in the cluster.
+                resource in the cluster. Note that if a resource (e.g., "CPU")
+                is currently not available (i.e., quantity is 0), it will not
+                be included in this dictionary.
         """
-        self._check_connected()
+        self._connect_and_get_accessor()
 
         available_resources_by_id = self.available_resources_per_node()
 
@@ -790,20 +963,13 @@ class GlobalState:
 
     def get_system_config(self):
         """Get the system config of the cluster."""
-        self._check_connected()
-        return json.loads(self.global_state_accessor.get_system_config())
-
-    def get_node_to_connect_for_driver(self, node_ip_address):
-        """Get the node to connect for a Ray driver."""
-        self._check_connected()
-        return self.global_state_accessor.get_node_to_connect_for_driver(
-            node_ip_address
-        )
+        accessor = self._connect_and_get_accessor()
+        return json.loads(accessor.get_system_config())
 
     def get_node(self, node_id: str):
         """Get the node information for a node id."""
-        self._check_connected()
-        return self.global_state_accessor.get_node(node_id)
+        accessor = self._connect_and_get_accessor()
+        return accessor.get_node(node_id)
 
     def get_draining_nodes(self) -> Dict[str, int]:
         """Get all the hex ids of nodes that are being drained
@@ -811,8 +977,76 @@ class GlobalState:
 
         There is no deadline if the timestamp is 0.
         """
-        self._check_connected()
-        return self.global_state_accessor.get_draining_nodes()
+        accessor = self._connect_and_get_accessor()
+        return accessor.get_draining_nodes()
+
+    def get_cluster_config(self) -> autoscaler_pb2.ClusterConfig:
+        """Get the cluster config of the current cluster."""
+        accessor = self._connect_and_get_accessor()
+        serialized_cluster_config = accessor.get_internal_kv(
+            ray._raylet.GCS_AUTOSCALER_STATE_NAMESPACE.encode(),
+            ray._raylet.GCS_AUTOSCALER_CLUSTER_CONFIG_KEY.encode(),
+        )
+        if serialized_cluster_config:
+            return autoscaler_pb2.ClusterConfig.FromString(serialized_cluster_config)
+        return None
+
+    @staticmethod
+    def _calculate_max_resource_from_cluster_config(
+        cluster_config: Optional[autoscaler_pb2.ClusterConfig], key: str
+    ) -> Optional[int]:
+        """Calculate the maximum available resources for a given resource type from cluster config.
+        If the resource type is not available, return None.
+        """
+        if cluster_config is None:
+            return None
+
+        max_value = 0
+        for node_group_config in cluster_config.node_group_configs:
+            num_resources = node_group_config.resources.get(key, default=0)
+            num_nodes = node_group_config.max_count
+            if num_nodes == 0 or num_resources == 0:
+                continue
+            if num_nodes == -1 or num_resources == -1:
+                return sys.maxsize
+            max_value += num_nodes * num_resources
+        if max_value == 0:
+            return None
+        max_value_limit = cluster_config.max_resources.get(key, default=sys.maxsize)
+        return min(max_value, max_value_limit)
+
+    def get_max_resources_from_cluster_config(self) -> Optional[Dict[str, int]]:
+        """Get the maximum available resources for all resource types from cluster config.
+
+        Returns:
+            A dictionary mapping resource name to the maximum quantity of that
+            resource that could be available in the cluster based on the cluster config.
+            Returns None if the config is not available.
+            Values in the dictionary default to 0 if there is no such resource.
+        """
+        all_resource_keys = set()
+
+        config = self.get_cluster_config()
+        if config is None:
+            return None
+
+        if config.node_group_configs:
+            for node_group_config in config.node_group_configs:
+                all_resource_keys.update(node_group_config.resources.keys())
+        if len(all_resource_keys) == 0:
+            return None
+
+        result = {}
+        for key in all_resource_keys:
+            max_value = self._calculate_max_resource_from_cluster_config(config, key)
+            result[key] = max_value if max_value is not None else 0
+
+        return result
+
+    def get_actor_info(self, actor_id: ray.ActorID) -> Optional[str]:
+        """Get the actor info for a actor id."""
+        accessor = self._connect_and_get_accessor()
+        return accessor.get_actor_info(actor_id)
 
 
 state = GlobalState()
@@ -886,15 +1120,20 @@ def node_ids():
         List of the node resource ids.
     """
     node_ids = []
-    for node in nodes():
-        for k, v in node["Resources"].items():
-            if k.startswith(NODE_ID_PREFIX) and k != HEAD_NODE_RESOURCE_NAME:
-                node_ids.append(k)
+    for node_total_resources in state.total_resources_per_node().values():
+        for resource_id in node_total_resources.keys():
+            if (
+                resource_id.startswith(NODE_ID_PREFIX)
+                and resource_id != HEAD_NODE_RESOURCE_NAME
+            ):
+                node_ids.append(resource_id)
     return node_ids
 
 
 def actors(
-    actor_id: str = None, job_id: ray.JobID = None, actor_state_name: str = None
+    actor_id: Optional[str] = None,
+    job_id: Optional[ray.JobID] = None,
+    actor_state_name: Optional[str] = None,
 ):
     """Fetch actor info for one or more actor IDs (for debugging only).
 
@@ -919,14 +1158,14 @@ def actors(
 
 @DeveloperAPI
 @client_mode_hook
-def timeline(filename=None):
+def timeline(filename: Optional[str] = None):
     """Return a list of profiling events that can viewed as a timeline.
 
     Ray profiling must be enabled by setting the RAY_PROFILING=1 environment
     variable prior to starting Ray, and set RAY_task_events_report_interval_ms=0
 
     To view this information as a timeline, simply dump it as a json file by
-    passing in "filename" or using using json.dump, and then load go to
+    passing in "filename" or using json.dump, and then load go to
     chrome://tracing in the Chrome web browser and load the dumped file.
 
     Args:
@@ -936,15 +1175,31 @@ def timeline(filename=None):
     Returns:
         If filename is not provided, this returns a list of profiling events.
             Each profile event is a dictionary.
+
+    Raises:
+        RuntimeError: An exception is raised if ray.init() has not been called yet.
     """
+    if not ray.is_initialized():
+        raise RuntimeError(
+            "Ray has not been started yet. Timeline requires Ray to be initialized first."
+        )
+
+    logger.warning(
+        "In the near future, ray.timeline() will read task profiling events from the Ray "
+        "dashboard (API server) instead of from GCS. If you have already turned on "
+        "RAY_enable_task_events_to_dashboard_head, ray.timeline() reads from the dashboard "
+        "now. Make sure your Ray cluster is started with the dashboard running if you want "
+        "to use ray.timeline()."
+    )
+
     return state.chrome_tracing_dump(filename=filename)
 
 
-def object_transfer_timeline(filename=None):
+def object_transfer_timeline(filename: Optional[str] = None):
     """Return a list of transfer events that can viewed as a timeline.
 
     To view this information as a timeline, simply dump it as a json file by
-    passing in "filename" or using using json.dump, and then load go to
+    passing in "filename" or using json.dump, and then load go to
     chrome://tracing in the Chrome web browser and load the dumped file. Make
     sure to enable "Flow events" in the "View Options" menu.
 
@@ -986,7 +1241,9 @@ def available_resources():
 
     Returns:
         A dictionary mapping resource name to the total quantity of that
-            resource in the cluster.
+            resource in the cluster. Note that if a resource (e.g., "CPU")
+            is currently not available (i.e., quantity is 0), it will not
+            be included in this dictionary.
     """
     return state.available_resources()
 
@@ -1004,7 +1261,20 @@ def available_resources_per_node():
     return state.available_resources_per_node()
 
 
-def update_worker_debugger_port(worker_id, debugger_port):
+@DeveloperAPI
+def total_resources_per_node():
+    """Get the current total resources of each live node.
+
+    Note that this information can grow stale as tasks start and finish.
+
+    Returns:
+        A dictionary mapping node hex id to total resources dictionary.
+    """
+
+    return state.total_resources_per_node()
+
+
+def update_worker_debugger_port(worker_id: bytes, debugger_port: int):
     """Update the debugger port of a worker.
 
     Args:
@@ -1017,7 +1287,7 @@ def update_worker_debugger_port(worker_id, debugger_port):
     return state.update_worker_debugger_port(worker_id, debugger_port)
 
 
-def update_worker_num_paused_threads(worker_id, num_paused_threads_delta):
+def update_worker_num_paused_threads(worker_id: bytes, num_paused_threads_delta: int):
     """Update the number of paused threads of a worker.
 
     Args:
@@ -1030,7 +1300,7 @@ def update_worker_num_paused_threads(worker_id, num_paused_threads_delta):
     return state.update_worker_num_paused_threads(worker_id, num_paused_threads_delta)
 
 
-def get_worker_debugger_port(worker_id):
+def get_worker_debugger_port(worker_id: bytes):
     """Get the debugger port of a worker.
 
     Args:

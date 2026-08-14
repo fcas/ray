@@ -1,7 +1,10 @@
 # This example showcases how to use Tensorflow with Ray Train.
 # Original code:
 # https://www.tensorflow.org/tutorials/distribute/multi_worker_with_keras
-# https://blog.keras.io/building-autoencoders-in-keras.html
+import os
+
+os.environ["TF_USE_LEGACY_KERAS"] = "1"
+
 import argparse
 
 import numpy as np
@@ -14,7 +17,7 @@ from ray import train
 from ray.air.integrations.keras import ReportCheckpointCallback
 from ray.data.datasource import SimpleTensorFlowDatasource
 from ray.data.extensions import TensorArray
-from ray.train import Result
+from ray.train import Result, ScalingConfig
 from ray.train.tensorflow import TensorflowTrainer, prepare_dataset_shard
 
 
@@ -121,7 +124,7 @@ def train_tensorflow_mnist(
 ) -> Result:
     train_dataset = get_dataset(split_type="train")
     config = {"lr": 1e-3, "batch_size": 64, "epochs": epochs}
-    scaling_config = dict(num_workers=num_workers, use_gpu=use_gpu)
+    scaling_config = ScalingConfig(num_workers=num_workers, use_gpu=use_gpu)
     trainer = TensorflowTrainer(
         train_loop_per_worker=train_func,
         train_loop_config=config,

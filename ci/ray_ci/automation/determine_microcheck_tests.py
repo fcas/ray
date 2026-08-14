@@ -1,10 +1,12 @@
-import click
-from typing import List, Set, Dict
+from typing import Dict, List, Set
 
-from ci.ray_ci.utils import logger, ci_init
+import click
+
+from ci.ray_ci.utils import ci_init, logger
+
 from ray_release.configs.global_config import get_global_config
-from ray_release.test import Test
 from ray_release.result import ResultStatus
+from ray_release.test import Test
 from ray_release.test_automation.ci_state_machine import CITestStateMachine
 
 # The s3 prefix for the tests that run on Linux. It comes from the bazel prefix rule
@@ -61,6 +63,7 @@ def main(
 
 def _update_high_impact_tests(tests: List[Test], high_impact_tests: Set[str]) -> None:
     for test in tests:
+        test.update_from_s3()
         test_name = test.get_name()
         test[Test.KEY_IS_HIGH_IMPACT] = (
             "true" if test_name in high_impact_tests else "false"

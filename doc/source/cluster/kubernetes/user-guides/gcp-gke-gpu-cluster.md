@@ -1,3 +1,9 @@
+---
+myst:
+  html_meta:
+    description: "Create a GKE cluster with a GPU node pool for KubeRay, including optional manual driver installation."
+---
+
 (kuberay-gke-gpu-cluster-setup)=
 
 # Start Google Cloud GKE Cluster with GPUs for KubeRay
@@ -59,10 +65,10 @@ If you encounter any issues with the GPU drivers installed by GKE, you can manua
 # Install NVIDIA GPU device driver
 kubectl apply -f https://raw.githubusercontent.com/GoogleCloudPlatform/container-engine-accelerators/master/nvidia-driver-installer/cos/daemonset-preloaded-latest.yaml
 
-# Verify that your nodes have allocatable GPUs 
+# Verify that your nodes have allocatable GPUs
 kubectl get nodes "-o=custom-columns=NAME:.metadata.name,GPU:.status.allocatable.nvidia\.com/gpu"
 
-# Verify that your nodes have allocatable GPUs 
+# Verify that your nodes have allocatable GPUs
 # NAME     GPU
 # ......   <none>
 # ......   1

@@ -2,14 +2,16 @@
 different clusters for multiple users. It receives node provider function calls
 through HTTP requests from remote CoordinatorSenderNodeProvider and runs them
 locally in LocalNodeProvider. To start the webserver the user runs:
-`python coordinator_server.py --ips <comma separated ips> --port <PORT>`."""
+`python coordinator_server.py --ips <comma separated ips> --host <HOST> --port <PORT>`."""
 import argparse
 import json
 import logging
 import socket
 import threading
 from http.server import HTTPServer, SimpleHTTPRequestHandler
+from typing import List, Optional, Tuple
 
+from ray._common.network_utils import build_address
 from ray.autoscaler._private.local.node_provider import LocalNodeProvider
 
 logger = logging.getLogger(__name__)
@@ -24,12 +26,16 @@ def runner_handler(node_provider):
         remote CoordinatorSenderNodeProvider.
         """
 
-        def _do_header(self, response_code=200, headers=None):
+        def _do_header(
+            self,
+            response_code: int = 200,
+            headers: Optional[List[Tuple[str, str]]] = None,
+        ):
             """Sends the header portion of the HTTP response.
 
             Args:
                 response_code: Standard HTTP response code
-                headers (list[tuples]): Standard HTTP response headers
+                headers: Standard HTTP response headers
             """
             if headers is None:
                 headers = [("Content-type", "application/json")]
@@ -76,7 +82,7 @@ class OnPremCoordinatorServer(threading.Thread):
         """Initialize HTTPServer and serve forever by invoking self.run()."""
 
         logger.info(
-            "Running on prem coordinator server on address " + host + ":" + str(port)
+            "Running on prem coordinator server on address " + build_address(host, port)
         )
         threading.Thread.__init__(self)
         self._port = port
@@ -106,16 +112,23 @@ def main():
         "--ips", required=True, help="Comma separated list of node ips."
     )
     parser.add_argument(
+        "--host",
+        type=str,
+        required=False,
+        help="The Host on which the coordinator listens.",
+    )
+    parser.add_argument(
         "--port",
         type=int,
         required=True,
         help="The port on which the coordinator listens.",
     )
     args = parser.parse_args()
+    host = args.host or socket.gethostbyname(socket.gethostname())
     list_of_node_ips = args.ips.split(",")
     OnPremCoordinatorServer(
         list_of_node_ips=list_of_node_ips,
-        host=socket.gethostbyname(socket.gethostname()),
+        host=host,
         port=args.port,
     )
 

@@ -2,22 +2,71 @@ import asyncio
 import inspect
 import json
 import logging
+import math
 import pickle
 import socket
 from collections import deque
+from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, List, Optional, Tuple, Type
+from typing import (
+    Any,
+    AsyncGenerator,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+    Type,
+    Union,
+)
 
 import starlette
+import uvicorn
+from fastapi import FastAPI
 from fastapi.encoders import jsonable_encoder
+from fastapi.routing import APIRoute, APIWebSocketRoute
+from packaging import version
+from starlette.datastructures import MutableHeaders
+from starlette.middleware import Middleware
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from uvicorn.config import Config
 from uvicorn.lifespan.on import LifespanOn
 
-from ray._private.pydantic_compat import IS_PYDANTIC_2
-from ray.serve._private.constants import SERVE_LOGGER_NAME
-from ray.serve._private.utils import serve_encoders
-from ray.serve.exceptions import RayServeException
+try:
+    # `_IncludedRouter` only exists on FastAPI >= 0.137, where routes registered
+    # via `include_router` are nested under it instead of being flattened into
+    # the parent's `routes` list. It is `None` on older versions.
+    from fastapi.routing import _IncludedRouter
+except ImportError:  # FastAPI < 0.137
+    _IncludedRouter = None
+
+from ray._common.network_utils import is_ipv6
+from ray.exceptions import RayActorError, RayTaskError
+from ray.serve._private.common import RequestMetadata
+from ray.serve._private.constants import (
+    RAY_SERVE_HTTP_KEEP_ALIVE_TIMEOUT_S,
+    RAY_SERVE_HTTP_PROXY_CALLBACK_IMPORT_PATH,
+    RAY_SERVE_REQUEST_PROCESSING_TIMEOUT_S,
+    SERVE_HTTP_REQUEST_DISCONNECT_DISABLED_HEADER,
+    SERVE_HTTP_REQUEST_ID_HEADER,
+    SERVE_HTTP_REQUEST_TIMEOUT_S_HEADER,
+    SERVE_LOGGER_NAME,
+    SERVE_SESSION_ID,
+)
+from ray.serve._private.constants_utils import warn_if_deprecated_env_var_set
+from ray.serve._private.proxy_request_response import ResponseStatus
+from ray.serve._private.utils import (
+    call_function_from_import_path,
+    generate_request_id,
+    serve_encoders,
+)
+from ray.serve.config import HTTPOptions
+from ray.serve.exceptions import (
+    BackPressureError,
+    DeploymentUnavailableError,
+    RayServeException,
+)
 
 logger = logging.getLogger(SERVE_LOGGER_NAME)
 
@@ -61,7 +110,9 @@ def make_buffered_asgi_receive(serialized_body: bytes) -> Receive:
 
 
 def convert_object_to_asgi_messages(
-    obj: Optional[Any] = None, status_code: int = 200
+    obj: Optional[Any] = None,
+    status_code: int = 200,
+    extra_headers: Optional[List[Tuple[bytes, bytes]]] = None,
 ) -> List[Message]:
     """Serializes the provided object and converts it to ASGI messages.
 
@@ -89,11 +140,15 @@ def convert_object_to_asgi_messages(
         ).encode()
         content_type = b"application/json"
 
+    headers = [[b"content-type", content_type]]
+    if extra_headers:
+        headers.extend(list(header) for header in extra_headers)
+
     return [
         {
             "type": "http.response.start",
             "status": status_code,
-            "headers": [[b"content-type", content_type]],
+            "headers": headers,
         },
         {"type": "http.response.body", "body": body},
     ]
@@ -110,12 +165,12 @@ class Response:
     >>> await Response({"k": "v"}).send(scope, receive, send) # doctest: +SKIP
     """
 
-    def __init__(self, content=None, status_code=200):
+    def __init__(self, content: Any = None, status_code: int = 200):
         """Construct a HTTP Response based on input type.
 
         Args:
             content: Any JSON serializable object.
-            status_code (int, optional): Default status code is 200.
+            status_code: Default status code is 200.
         """
         self._messages = convert_object_to_asgi_messages(
             obj=content,
@@ -156,6 +211,7 @@ class MessageQueue(Send):
         self._message_queue = deque()
         self._new_message_event = asyncio.Event()
         self._closed = False
+        self._error = None
 
     def close(self):
         """Close the queue, rejecting new messages.
@@ -166,6 +222,9 @@ class MessageQueue(Send):
         """
         self._closed = True
         self._new_message_event.set()
+
+    def set_error(self, e: BaseException):
+        self._error = e
 
     def put_nowait(self, message: Message):
         self._message_queue.append(message)
@@ -181,6 +240,18 @@ class MessageQueue(Send):
 
         self.put_nowait(message)
 
+    async def wait_for_message(self):
+        """Wait until at least one new message is available.
+
+        If a message is available, this method will return immediately on each call
+        until `get_messages_nowait` is called.
+
+        After the queue is closed using `.close()`, this will always return
+        immediately.
+        """
+        if not self._closed:
+            await self._new_message_event.wait()
+
     def get_messages_nowait(self) -> List[Message]:
         """Returns all messages that are currently available (non-blocking).
 
@@ -195,17 +266,81 @@ class MessageQueue(Send):
         self._new_message_event.clear()
         return messages
 
-    async def wait_for_message(self):
-        """Wait until at least one new message is available.
+    async def get_one_message(self) -> Message:
+        """This blocks until a message is ready.
 
-        If a message is available, this method will return immediately on each call
-        until `get_messages_nowait` is called.
+        This method should not be used together with get_messages_nowait.
+        Please use either `get_one_message` or `get_messages_nowait`.
 
-        After the queue is closed using `.close()`, this will always return
-        immediately.
+        Returns:
+            The next available ASGI message in the queue.
+
+        Raises:
+            StopAsyncIteration: if the queue is closed and there are no
+                more messages.
+            Exception (self._error): if there are no more messages in
+                the queue and an error has been set.
         """
-        if not self._closed:
-            await self._new_message_event.wait()
+
+        if self._error:
+            raise self._error
+
+        await self._new_message_event.wait()
+
+        if len(self._message_queue) > 0:
+            msg = self._message_queue.popleft()
+
+            if len(self._message_queue) == 0 and not self._closed:
+                self._new_message_event.clear()
+
+            return msg
+        elif len(self._message_queue) == 0 and self._error:
+            raise self._error
+        elif len(self._message_queue) == 0 and self._closed:
+            raise StopAsyncIteration
+
+    async def fetch_messages_from_queue(
+        self, call_fut: asyncio.Future
+    ) -> AsyncGenerator[List[Any], None]:
+        """Repeatedly consume messages from the queue and yield them.
+
+        This is used to fetch queue messages in the system event loop in
+        a thread-safe manner.
+
+        Args:
+            call_fut: The async Future pointing to the task from the user
+                code event loop that is pushing messages onto the queue.
+
+        Yields:
+            List[Any]: Messages from the queue.
+        """
+        # Repeatedly consume messages from the queue.
+        wait_for_msg_task = None
+        try:
+            while True:
+                wait_for_msg_task = asyncio.create_task(self.wait_for_message())
+                done, _ = await asyncio.wait(
+                    [call_fut, wait_for_msg_task], return_when=asyncio.FIRST_COMPLETED
+                )
+
+                messages = self.get_messages_nowait()
+                if messages:
+                    yield messages
+
+                # Exit once `call_fut` has finished. In this case, all
+                # messages must have already been sent.
+                if call_fut in done:
+                    break
+
+            e = call_fut.exception()
+            if e is not None:
+                raise e from None
+        finally:
+            if not call_fut.done():
+                call_fut.cancel()
+
+            if wait_for_msg_task is not None and not wait_for_msg_task.done():
+                wait_for_msg_task.cancel()
 
 
 class ASGIReceiveProxy:
@@ -218,14 +353,15 @@ class ASGIReceiveProxy:
     def __init__(
         self,
         scope: Scope,
-        request_id: str,
-        receive_asgi_messages: Callable[[str], Awaitable[bytes]],
+        request_metadata: RequestMetadata,
+        receive_asgi_messages: Callable[[RequestMetadata], Awaitable[bytes]],
     ):
         self._type = scope["type"]  # Either 'http' or 'websocket'.
-        self._queue = asyncio.Queue()
-        self._request_id = request_id
+        # Lazy init the queue to ensure it is created in the user code event loop.
+        self._queue: Optional[asyncio.Queue] = None
+        self._request_metadata = request_metadata
         self._receive_asgi_messages = receive_asgi_messages
-        self._disconnect_message = None
+        self._disconnect_message: Optional[Message] = None
 
     def _get_default_disconnect_message(self) -> Message:
         """Return the appropriate disconnect message based on the connection type.
@@ -245,6 +381,13 @@ class ASGIReceiveProxy:
         else:
             return {"type": "http.disconnect"}
 
+    @property
+    def queue(self) -> asyncio.Queue:
+        if self._queue is None:
+            self._queue = asyncio.Queue()
+
+        return self._queue
+
     async def fetch_until_disconnect(self):
         """Fetch messages repeatedly until a disconnect message is received.
 
@@ -255,9 +398,11 @@ class ASGIReceiveProxy:
         """
         while True:
             try:
-                pickled_messages = await self._receive_asgi_messages(self._request_id)
+                pickled_messages = await self._receive_asgi_messages(
+                    self._request_metadata
+                )
                 for message in pickle.loads(pickled_messages):
-                    self._queue.put_nowait(message)
+                    self.queue.put_nowait(message)
 
                     if message["type"] in {"http.disconnect", "websocket.disconnect"}:
                         self._disconnect_message = message
@@ -267,12 +412,12 @@ class ASGIReceiveProxy:
                 # (i.e., the user disconnects). This is expected behavior and we should
                 # not log an error: https://github.com/ray-project/ray/issues/43290.
                 message = self._get_default_disconnect_message()
-                self._queue.put_nowait(message)
+                self.queue.put_nowait(message)
                 self._disconnect_message = message
                 return
             except Exception as e:
                 # Raise unexpected exceptions in the next `__call__`.
-                self._queue.put_nowait(e)
+                self.queue.put_nowait(e)
                 return
 
     async def __call__(self) -> Message:
@@ -280,14 +425,41 @@ class ASGIReceiveProxy:
 
         This will repeatedly return a disconnect message once it's been received.
         """
-        if self._queue.empty() and self._disconnect_message is not None:
+        if self.queue.empty() and self._disconnect_message is not None:
             return self._disconnect_message
 
-        message = await self._queue.get()
+        message = await self.queue.get()
         if isinstance(message, Exception):
             raise message
 
         return message
+
+
+def _walk_fastapi_routes(router, prefix: str = ""):
+    """Yield ``(route, parent_router, prefix)`` for every API route under ``router``.
+
+    Starting with FastAPI 0.137, ``include_router`` no longer flattens the
+    included routes into the parent's ``routes`` list. Instead it appends a
+    single ``_IncludedRouter`` node that holds a reference to the original
+    router (``route.original_router``) and resolves the child routes lazily at
+    request time. We recurse into those nodes so that routes registered via
+    ``include_router`` (e.g. vLLM's OpenAI-compatible endpoints) are still
+    discovered. On older FastAPI versions ``_IncludedRouter`` doesn't exist and
+    this simply iterates the flat ``routes`` list.
+
+    ``prefix`` is the URL prefix accumulated from the ``include_router(...,
+    prefix=...)`` calls above this route. When a prefix is supplied at include
+    time (rather than baked into an ``APIRouter(prefix=...)``), FastAPI >= 0.137
+    keeps it on the ``_IncludedRouter`` node instead of in the route's own
+    ``path``, so callers need it to reconstruct the absolute path.
+    """
+    for route in router.routes:
+        if isinstance(route, (APIRoute, APIWebSocketRoute)):
+            yield route, router, prefix
+        elif _IncludedRouter is not None and isinstance(route, _IncludedRouter):
+            yield from _walk_fastapi_routes(
+                route.original_router, prefix + route.include_context.prefix
+            )
 
 
 def make_fastapi_class_based_view(fastapi_app, cls: Type) -> None:
@@ -309,25 +481,35 @@ def make_fastapi_class_based_view(fastapi_app, cls: Type) -> None:
     """
     # Delayed import to prevent ciruclar imports in workers.
     from fastapi import APIRouter, Depends
-    from fastapi.routing import APIRoute, APIWebSocketRoute
+    from starlette.routing import compile_path
 
-    def get_current_servable_instance():
+    async def get_current_servable_instance():
         from ray import serve
 
         return serve.get_replica_context().servable_object
 
-    # Find all the class method routes
+    # Find all the class method routes. We walk the route tree recursively so
+    # that routes registered via `include_router` are discovered on FastAPI
+    # >= 0.137, where they are nested under `_IncludedRouter` nodes rather than
+    # flattened into `fastapi_app.routes`. Each entry keeps the parent router so
+    # the route can be removed from the correct list below.
     class_method_routes = [
-        route
-        for route in fastapi_app.routes
-        if
-        # User defined routes must all be APIRoute or APIWebSocketRoute.
-        isinstance(route, (APIRoute, APIWebSocketRoute))
+        (route, parent, prefix)
+        for route, parent, prefix in _walk_fastapi_routes(fastapi_app)
         # We want to find the route that's bound to the `cls`.
         # NOTE(simon): we can't use `route.endpoint in inspect.getmembers(cls)`
         # because the FastAPI supports different routes for the methods with
         # same name. See #17559.
-        and (cls.__qualname__ in route.endpoint.__qualname__)
+        # NOTE: We check against all classes in the MRO to handle inherited
+        # methods. When a method is inherited, its __qualname__ still references
+        # the parent class (e.g., "ParentClass.method" not "ChildClass.method").
+        # We use "ClassName." prefix matching (not substring) to avoid false
+        # positives where class "A" would incorrectly match routes from "AA".
+        if any(
+            route.endpoint.__qualname__.startswith(base.__qualname__ + ".")
+            for base in cls.__mro__
+            if base is not object
+        )
     ]
 
     # Modify these routes and mount it to a new APIRouter.
@@ -335,8 +517,20 @@ def make_fastapi_class_based_view(fastapi_app, cls: Type) -> None:
     # the laster fastapi_app.include_router to re-run the dependency analysis
     # for each routes.
     new_router = APIRouter()
-    for route in class_method_routes:
-        fastapi_app.routes.remove(route)
+    for route, parent, prefix in class_method_routes:
+        parent.routes.remove(route)
+
+        # Preserve the full URL path. When a route was registered via
+        # `include_router(..., prefix=...)`, FastAPI >= 0.137 keeps the prefix on
+        # the `_IncludedRouter` node rather than in `route.path`, so re-mounting
+        # the route on `new_router` (which has no prefix) would drop it. Fold the
+        # accumulated prefix back into the route's path before re-mounting.
+        if prefix:
+            full_path = prefix + route.path
+            route.path = full_path
+            route.path_regex, route.path_format, route.param_convertors = compile_path(
+                full_path
+            )
 
         # This block just adds a default values to the self parameters so that
         # FastAPI knows to inject the object when calling the route.
@@ -362,38 +556,25 @@ def make_fastapi_class_based_view(fastapi_app, cls: Type) -> None:
             for parameter in old_parameters[1:]
         ]
         new_signature = old_signature.replace(parameters=new_parameters)
-        setattr(route.endpoint, "__signature__", new_signature)
-        setattr(route.endpoint, "_serve_cls", cls)
+        route.endpoint.__signature__ = new_signature
+        route.endpoint._serve_cls = cls
         new_router.routes.append(route)
     fastapi_app.include_router(new_router)
 
-    routes_to_remove = list()
-    for route in fastapi_app.routes:
-        if not isinstance(route, (APIRoute, APIWebSocketRoute)):
-            continue
-
-        # If there is a response model, FastAPI creates a copy of the fields.
-        # But FastAPI creates the field incorrectly by missing the outer_type_.
-        if (
-            # TODO(edoakes): I don't think this check is complete because we need
-            # to support v1 models in v2 (from pydantic.v1 import *).
-            not IS_PYDANTIC_2
-            and isinstance(route, APIRoute)
-            and route.response_model
-        ):
-            route.secure_cloned_response_field.outer_type_ = (
-                route.response_field.outer_type_
-            )
-
-        # Remove endpoints that belong to other class based views.
+    # Remove endpoints that belong to other class based views. We walk the tree
+    # recursively (see `_walk_fastapi_routes`) so that endpoints nested under
+    # `_IncludedRouter` nodes are also cleaned up on FastAPI >= 0.137.
+    for route, parent, _prefix in list(_walk_fastapi_routes(fastapi_app)):
         serve_cls = getattr(route.endpoint, "_serve_cls", None)
         if serve_cls is not None and serve_cls != cls:
-            routes_to_remove.append(route)
-    fastapi_app.routes[:] = [r for r in fastapi_app.routes if r not in routes_to_remove]
+            parent.routes.remove(route)
 
 
 def set_socket_reuse_port(sock: socket.socket) -> bool:
     """Mutate a socket object to allow multiple process listening on the same port.
+
+    Args:
+        sock: The socket to configure with SO_REUSEPORT.
 
     Returns:
         success: whether the setting was successful.
@@ -424,15 +605,48 @@ def set_socket_reuse_port(sock: socket.socket) -> bool:
 class ASGIAppReplicaWrapper:
     """Provides a common wrapper for replicas running an ASGI app."""
 
-    def __init__(self, app: ASGIApp):
+    def __init__(self, app_or_func: Optional[Union[ASGIApp, Callable]]):
+        if app_or_func is None:
+            # Late-bound: `__serve_build_asgi_app__` will supply the app at
+            # replica init time. `__del__` tolerates the missing
+            # `_serve_asgi_lifespan` attribute.
+            return
+        if inspect.isfunction(app_or_func):
+            app = app_or_func()
+        else:
+            app = app_or_func
+
+        self._set_asgi_app(app)
+
+    def _set_asgi_app(self, app: ASGIApp) -> None:
         self._asgi_app = app
 
         # Use uvicorn's lifespan handling code to properly deal with
         # startup and shutdown event.
-        self._serve_asgi_lifespan = LifespanOn(Config(self._asgi_app, lifespan="on"))
+        # If log_config is not None, uvicorn will use the default logger.
+        # and that interferes with our logging setup.
+        self._serve_asgi_lifespan = LifespanOn(
+            Config(
+                self._asgi_app,
+                lifespan="on",
+                log_level=None,
+                log_config=None,
+                access_log=False,
+            )
+        )
 
         # Replace uvicorn logger with our own.
         self._serve_asgi_lifespan.logger = logger
+
+    @property
+    def app(self) -> ASGIApp:
+        return self._asgi_app
+
+    @property
+    def docs_path(self) -> Optional[str]:
+        if isinstance(self._asgi_app, FastAPI):
+            return self._asgi_app.docs_url
+        return None
 
     async def _run_asgi_lifespan_startup(self):
         # LifespanOn's logger logs in INFO level thus becomes spammy
@@ -451,7 +665,7 @@ class ASGIAppReplicaWrapper:
         scope: Scope,
         receive: Receive,
         send: Send,
-    ) -> Optional[ASGIApp]:
+    ) -> None:
         """Calls into the wrapped ASGI app."""
         await self._asgi_app(
             scope,
@@ -462,6 +676,9 @@ class ASGIAppReplicaWrapper:
     # NOTE: __del__ must be async so that we can run ASGI shutdown
     # in the same event loop.
     async def __del__(self):
+        if not hasattr(self, "_serve_asgi_lifespan"):
+            return
+
         # LifespanOn's logger logs in INFO level thus becomes spammy.
         # Within this block we temporarily uplevel for cleaner logging.
         from ray.serve._private.logging_utils import LoggingContext
@@ -472,7 +689,7 @@ class ASGIAppReplicaWrapper:
 
 def validate_http_proxy_callback_return(
     middlewares: Any,
-) -> [starlette.middleware.Middleware]:
+) -> List[Middleware]:
     """Validate the return value of HTTP proxy callback.
 
     Middlewares should be a list of Starlette middlewares. If it is None, we
@@ -491,9 +708,330 @@ def validate_http_proxy_callback_return(
         # All middlewares must be Starlette middlewares.
         # https://www.starlette.io/middleware/#using-pure-asgi-middleware
         for middleware in middlewares:
-            if not issubclass(type(middleware), starlette.middleware.Middleware):
+            if not issubclass(type(middleware), Middleware):
                 raise ValueError(
                     "HTTP proxy callback must return a list of Starlette middlewares, "
                     f"instead got {type(middleware)} type item in the list."
                 )
     return middlewares
+
+
+class RequestIdMiddleware:
+    def __init__(self, app: ASGIApp):
+        self._app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send):
+        headers = MutableHeaders(scope=scope)
+        request_id = headers.get(SERVE_HTTP_REQUEST_ID_HEADER)
+
+        if request_id is None:
+            request_id = generate_request_id()
+            headers.append(SERVE_HTTP_REQUEST_ID_HEADER, request_id)
+
+        async def send_with_request_id(message: Message):
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                headers.append("X-Request-ID", request_id)
+            if message["type"] == "websocket.accept":
+                message["X-Request-ID"] = request_id
+            await send(message)
+
+        await self._app(scope, receive, send_with_request_id)
+
+
+def _apply_middlewares(app: ASGIApp, middlewares: List[Callable]) -> ASGIApp:
+    """Wrap the ASGI app with the provided middlewares.
+
+    The built-in RequestIdMiddleware will always be applied first.
+    """
+    for middleware in [Middleware(RequestIdMiddleware)] + middlewares:
+        if version.parse(starlette.__version__) < version.parse("0.35.0"):
+            app = middleware.cls(app, **middleware.options)
+        else:
+            # In starlette >= 0.35.0, middleware.options does not exist:
+            # https://github.com/encode/starlette/pull/2381.
+            app = middleware.cls(
+                app,
+                *middleware.args,
+                **middleware.kwargs,
+            )
+
+    return app
+
+
+async def start_asgi_http_server(
+    app: ASGIApp,
+    http_options: HTTPOptions,
+    *,
+    event_loop: asyncio.AbstractEventLoop,
+    enable_so_reuseport: bool = False,
+) -> Tuple[asyncio.Task, uvicorn.Server]:
+    """Start an HTTP server to run the ASGI app.
+
+    Returns a task that blocks until the server exits (e.g., due to error) and
+    the server object itself (so callers can shut it down gracefully).
+    """
+    app = _apply_middlewares(app, http_options.middlewares)
+
+    sock = socket.socket(
+        socket.AF_INET6 if is_ipv6(http_options.host) else socket.AF_INET,
+        socket.SOCK_STREAM,
+    )
+    if enable_so_reuseport:
+        set_socket_reuse_port(sock)
+
+    try:
+        sock.bind((http_options.host, http_options.port))
+    except OSError as e:
+        raise RuntimeError(
+            f"Failed to bind to address '{http_options.host}:{http_options.port}'."
+        ) from e
+
+    # Even though we set log_level=None, uvicorn adds MessageLoggerMiddleware
+    # if log level for uvicorn.error is not set. And MessageLoggerMiddleware
+    # has no use to us.
+    logging.getLogger("uvicorn.error").level = logging.CRITICAL
+
+    # Configure SSL if certificates are provided
+    ssl_kwargs = {}
+    if http_options.ssl_keyfile and http_options.ssl_certfile:
+        ssl_kwargs = {
+            "ssl_keyfile": http_options.ssl_keyfile,
+            "ssl_certfile": http_options.ssl_certfile,
+        }
+        if http_options.ssl_keyfile_password:
+            ssl_kwargs["ssl_keyfile_password"] = http_options.ssl_keyfile_password
+        if http_options.ssl_ca_certs:
+            ssl_kwargs["ssl_ca_certs"] = http_options.ssl_ca_certs
+
+        logger.info(
+            f"Starting HTTPS server on {http_options.host}:{http_options.port} "
+            f"with SSL certificate: {http_options.ssl_certfile}"
+        )
+
+    # NOTE: We have to use lower level uvicorn Config and Server
+    # class because we want to run the server as a coroutine. The only
+    # alternative is to call uvicorn.run which is blocking.
+    server = uvicorn.Server(
+        config=uvicorn.Config(
+            lambda: app,
+            factory=True,
+            host=http_options.host,
+            port=http_options.port,
+            root_path=http_options.root_path,
+            timeout_keep_alive=http_options.keep_alive_timeout_s,
+            loop=event_loop,
+            lifespan="off",
+            access_log=False,
+            log_level=None,
+            log_config=None,
+            **ssl_kwargs,
+        )
+    )
+
+    # NOTE(edoakes): we need to override install_signal_handlers here
+    # because the existing implementation fails if it isn't running in
+    # the main thread and uvicorn doesn't expose a way to configure it.
+    server.install_signal_handlers = lambda: None
+
+    return event_loop.create_task(server.serve(sockets=[sock])), server
+
+
+def parse_request_timeout_header(
+    headers: Dict[bytes, bytes],
+    default_timeout_s: Optional[float],
+) -> Optional[float]:
+    """Parse the per-request timeout from the ``x-request-timeout-seconds`` header.
+
+    Returns the header value when valid and positive, ``None`` when the header is
+    present but non-positive (meaning "disable the timeout"), or ``default_timeout_s``
+    when the header is absent or malformed.
+    """
+    header_name = SERVE_HTTP_REQUEST_TIMEOUT_S_HEADER.encode("utf-8")
+    if header_name not in headers:
+        return default_timeout_s
+
+    value = headers[header_name].decode("utf-8")
+    try:
+        timeout = float(value)
+        if timeout > 0:
+            return timeout
+        return None  # non-positive → disable timeout
+    except ValueError:
+        return default_timeout_s
+
+
+def parse_disconnect_disabled_header(headers: Dict[bytes, bytes]) -> bool:
+    """Return True if the ``x-request-disconnect-disabled`` header equals ``?1``.
+
+    When True, the caller should not monitor for client disconnects.
+    """
+    return (
+        headers.get(
+            SERVE_HTTP_REQUEST_DISCONNECT_DISABLED_HEADER.encode("utf-8"), b"?0"
+        ).decode("utf-8")
+        == "?1"
+    )
+
+
+def _matches_session_id_header(header_key: str) -> bool:
+    """True if ``header_key`` refers to the configured session-id header.
+
+    Compares case-insensitively and treats ``-`` and ``_`` as equivalent
+    so intermediate proxies that rewrite the separator (nginx, AWS API
+    Gateway, ...) don't silently drop session affinity. The header name
+    itself is whatever ``SERVE_SESSION_ID`` resolves to (set via the env
+    var ``RAY_SERVE_SESSION_ID_HEADER_KEY``).
+    """
+    return header_key.lower().replace("-", "_") == SERVE_SESSION_ID.lower().replace(
+        "-", "_"
+    )
+
+
+def session_id_from_headers(headers: Dict[str, str]) -> Optional[str]:
+    """Return the session-id header value from str-keyed headers, or None.
+
+    Same matching rule as ``parse_session_id_header`` (which takes bytes
+    keys); use this for already-decoded ``Dict[str, str]`` headers such as
+    Starlette ``request.headers`` or ``RawRequestInfo.headers``.
+    """
+    return next(
+        (value for key, value in headers.items() if _matches_session_id_header(key)),
+        None,
+    )
+
+
+def parse_session_id_header(headers: Dict[bytes, bytes]) -> str:
+    """Return the configured session-id header value, or '' if absent.
+
+    Header name is whatever ``SERVE_SESSION_ID`` resolves to (set via
+    ``RAY_SERVE_SESSION_ID_HEADER_KEY``).
+    """
+    for key, value in headers.items():
+        if _matches_session_id_header(key.decode("utf-8")):
+            return value.decode("utf-8")
+    return ""
+
+
+def get_http_response_status(
+    exc: BaseException, request_timeout_s: Optional[float], request_id: str
+) -> ResponseStatus:
+    if isinstance(exc, TimeoutError):
+        timeout_str = (
+            f"after {request_timeout_s}s" if request_timeout_s is not None else ""
+        )
+        return ResponseStatus(
+            code=408,
+            is_error=True,
+            message=f"Request {request_id} timed out {timeout_str}.".strip(),
+        )
+
+    elif isinstance(exc, asyncio.CancelledError):
+        message = f"Client for request {request_id} disconnected, cancelling request."
+        logger.info(message)
+        return ResponseStatus(
+            code=499,
+            is_error=True,
+            message=message,
+        )
+    elif isinstance(exc, BackPressureError):
+        if isinstance(exc, RayTaskError):
+            logger.warning(f"Request failed: {exc}", extra={"log_to_stderr": False})
+        return ResponseStatus(
+            code=exc.status_code,
+            is_error=True,
+            message=exc.message,
+            headers=retry_after_headers(exc.retry_after_s),
+        )
+    elif isinstance(exc, DeploymentUnavailableError):
+        if isinstance(exc, RayTaskError):
+            logger.warning(f"Request failed: {exc}", extra={"log_to_stderr": False})
+        return ResponseStatus(
+            code=503,
+            is_error=True,
+            message=exc.message,
+        )
+    else:
+        if isinstance(exc, (RayActorError, RayTaskError)):
+            logger.warning(f"Request failed: {exc}", extra={"log_to_stderr": False})
+        else:
+            logger.exception("Request failed due to unexpected error.")
+        return ResponseStatus(
+            code=500,
+            is_error=True,
+            message=str(exc),
+        )
+
+
+def retry_after_headers(
+    retry_after_s: Optional[float],
+) -> Optional[List[Tuple[bytes, bytes]]]:
+    """Builds a `Retry-After` header from a delay in seconds.
+
+    The header value must be a non-negative integer number of seconds
+    (RFC 9110 `delay-seconds`), so the value is rounded up to avoid
+    suggesting a retry earlier than configured, and clamped at 0 so an
+    invalid header is never emitted on the wire.
+    """
+    if retry_after_s is None:
+        return None
+    return [(b"retry-after", str(max(0, math.ceil(retry_after_s))).encode())]
+
+
+def send_http_response_on_exception(
+    status: ResponseStatus, response_started: bool
+) -> List[Message]:
+    if response_started or status.code not in (408, 429, 503):
+        return []
+    return convert_object_to_asgi_messages(
+        status.message,
+        # `ResponseStatus.code` is a `Union` shared with gRPC, but on the HTTP
+        # path it's always an `int` status code.
+        status_code=status.code,  # type: ignore[arg-type]
+        extra_headers=status.headers,
+    )
+
+
+def configure_http_options_with_defaults(http_options: HTTPOptions) -> HTTPOptions:
+    """Enhanced configuration with component-specific options."""
+
+    http_options = deepcopy(http_options)
+
+    # Warn if deprecated env var is set
+    warn_if_deprecated_env_var_set("RAY_SERVE_HTTP_KEEP_ALIVE_TIMEOUT_S")
+
+    # Apply environment defaults
+    if (RAY_SERVE_HTTP_KEEP_ALIVE_TIMEOUT_S or 0) > 0:
+        http_options.keep_alive_timeout_s = RAY_SERVE_HTTP_KEEP_ALIVE_TIMEOUT_S
+
+    # TODO: Deprecate SERVE_REQUEST_PROCESSING_TIMEOUT_S env var
+    if http_options.request_timeout_s or RAY_SERVE_REQUEST_PROCESSING_TIMEOUT_S:
+        http_options.request_timeout_s = (
+            http_options.request_timeout_s or RAY_SERVE_REQUEST_PROCESSING_TIMEOUT_S
+        )
+
+    http_options.middlewares = http_options.middlewares or []
+
+    return http_options
+
+
+def configure_http_middlewares(http_options: HTTPOptions) -> HTTPOptions:
+    http_options = deepcopy(http_options)
+
+    # Add environment variable middleware
+    if RAY_SERVE_HTTP_PROXY_CALLBACK_IMPORT_PATH:
+        logger.info(
+            f"Calling user-provided callback from import path "
+            f"'{RAY_SERVE_HTTP_PROXY_CALLBACK_IMPORT_PATH}'."
+        )
+
+        # noinspection PyTypeChecker
+        http_options.middlewares.extend(
+            validate_http_proxy_callback_return(
+                call_function_from_import_path(
+                    RAY_SERVE_HTTP_PROXY_CALLBACK_IMPORT_PATH
+                )
+            )
+        )
+
+    return http_options

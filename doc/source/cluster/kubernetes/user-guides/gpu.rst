@@ -1,3 +1,6 @@
+.. meta::
+   :description: Schedule GPU workloads on KubeRay: request GPUs, GPU autoscaling, override Ray GPU capacity, and use taints and node selectors.
+
 .. _kuberay-gpu:
 
 Using GPUs
@@ -18,10 +21,9 @@ Dependencies for GPU-based machine learning
 ___________________________________________
 
 The `Ray Docker Hub <https://hub.docker.com/r/rayproject/>`_ hosts CUDA-based container images packaged
-with Ray and certain machine learning libraries.
-For example, the image ``rayproject/ray-ml:2.6.3-gpu`` is ideal for running GPU-based ML workloads with Ray 2.6.3.
-The Ray ML images are packaged with dependencies (such as TensorFlow and PyTorch) needed for the Ray Libraries that are used in these docs.
-To add custom dependencies, use one, or both, of the following methods:
+with Ray. For example, the image ``rayproject/ray:2.57.0-gpu`` runs GPU-based workloads with Ray 2.57.0.
+These images don't include machine learning libraries such as TensorFlow and PyTorch, so add the ones
+your workload needs with one, or both, of the following methods:
 
 * Building a docker image using one of the official :ref:`Ray docker images <docker-images>` as base.
 * Using :ref:`Ray Runtime environments <runtime-environments>`.
@@ -30,7 +32,7 @@ To add custom dependencies, use one, or both, of the following methods:
 Configuring Ray pods for GPU usage
 __________________________________
 
-Using Nvidia GPUs requires specifying `nvidia.com/gpu` resource `limits` and `requests` in the container fields of your `RayCluster`'s
+Using NVIDIA GPUs requires specifying `nvidia.com/gpu` resource `limits` and `requests` in the container fields of your `RayCluster`'s
 `headGroupSpec` and/or `workerGroupSpecs`.
 
 Here is a config snippet for a RayCluster workerGroup of up
@@ -48,7 +50,7 @@ to 5 GPU workers.
         ...
         containers:
          - name: ray-node
-           image: rayproject/ray-ml:2.6.3-gpu
+           image: rayproject/ray:2.57.0-gpu
            ...
            resources:
             nvidia.com/gpu: 1 # Optional, included just for documentation.
@@ -187,7 +189,7 @@ GPU taints and tolerations
   for you. If you are using a managed Kubernetes service, you might not need to worry
   about this section.
 
-The `Nvidia gpu plugin`_ for Kubernetes applies `taints`_ to GPU nodes; these taints prevent non-GPU pods from being scheduled on GPU nodes.
+The `NVIDIA gpu plugin`_ for Kubernetes applies `taints`_ to GPU nodes; these taints prevent non-GPU pods from being scheduled on GPU nodes.
 Managed Kubernetes services like GKE, EKS, and AKS automatically apply matching `tolerations`_
 to pods requesting GPU resources. Tolerations are applied by means of Kubernetes's `ExtendedResourceToleration`_ `admission controller`_.
 If this admission controller is not enabled for your Kubernetes cluster, you may need to manually add a GPU toleration to each of your GPU pod configurations. For example,
@@ -207,7 +209,7 @@ If this admission controller is not enabled for your Kubernetes cluster, you may
    ...
    containers:
    - name: ray-node
-     image: rayproject/ray:nightly-gpu
+     image: rayproject/ray:2.57.0-gpu
      ...
 
 Node selectors and node labels
@@ -222,7 +224,7 @@ Further reference and discussion
 --------------------------------
 Read about Kubernetes device plugins `here <https://kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/device-plugins/>`__,
 about Kubernetes GPU plugins `here <https://kubernetes.io/docs/tasks/manage-gpus/scheduling-gpus>`__,
-and about Nvidia's GPU plugin for Kubernetes `here <https://github.com/NVIDIA/k8s-device-plugin>`__.
+and about NVIDIA's GPU plugin for Kubernetes `here <https://github.com/NVIDIA/k8s-device-plugin>`__.
 
 .. _`GKE`: https://cloud.google.com/kubernetes-engine/docs/how-to/gpus
 .. _`EKS`: https://docs.aws.amazon.com/eks/latest/userguide/eks-optimized-ami.html
@@ -235,7 +237,7 @@ and about Nvidia's GPU plugin for Kubernetes `here <https://github.com/NVIDIA/k8
 
 .. _`tolerations`: https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration/
 .. _`taints`: https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration/
-.. _`Nvidia gpu plugin`: https://github.com/NVIDIA/k8s-device-plugin
+.. _`NVIDIA gpu plugin`: https://github.com/NVIDIA/k8s-device-plugin
 .. _`admission controller`: https://kubernetes.io/docs/reference/access-authn-authz/admission-controllers/
 .. _`ExtendedResourceToleration`: https://kubernetes.io/docs/reference/access-authn-authz/admission-controllers/#extendedresourcetoleration
 .. _`Kubernetes docs`: https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/

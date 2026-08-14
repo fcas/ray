@@ -6,13 +6,13 @@ from ray.rllib.connectors.connector import (
     ConnectorContext,
 )
 from ray.rllib.connectors.registry import register_connector
+from ray.rllib.evaluation.collectors.agent_collector import AgentCollector
 from ray.rllib.policy.sample_batch import SampleBatch
+from ray.rllib.utils.annotations import OldAPIStack
 from ray.rllib.utils.typing import (
     AgentConnectorDataType,
     AgentConnectorsOutput,
 )
-from ray.rllib.utils.annotations import OldAPIStack
-from ray.rllib.evaluation.collectors.agent_collector import AgentCollector
 
 
 @OldAPIStack
@@ -36,7 +36,7 @@ class ViewRequirementAgentConnector(AgentConnector):
         super().__init__(ctx)
 
         self._view_requirements = ctx.view_requirements
-        _enable_new_api_stack = ctx.config.get("enable_rl_module_and_learner", False)
+        _enable_new_api_stack = False
 
         # a dict of env_id to a dict of agent_id to a list of agent_collector objects
         self.agent_collectors = defaultdict(

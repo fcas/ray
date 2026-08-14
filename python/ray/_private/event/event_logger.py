@@ -1,19 +1,18 @@
-import logging
-import pathlib
 import json
-import random
-import string
-import socket
+import logging
 import os
+import pathlib
+import random
+import socket
+import string
 import threading
-
-from typing import Dict, Optional
 from datetime import datetime
+from typing import Dict, Optional
 
 from google.protobuf.json_format import Parse
 
-from ray.core.generated.event_pb2 import Event
 from ray._private.protobuf_compat import message_to_dict
+from ray.core.generated.event_pb2 import Event
 
 global_logger = logging.getLogger(__name__)
 
@@ -101,8 +100,12 @@ class EventLoggerAdapter:
             )
         )
 
-        # Force flush so that we won't lose events
-        self.logger.handlers[0].flush()
+        # Force flush all handlers so that we won't lose events.
+        for handler in self.logger.handlers[:]:
+            try:
+                handler.flush()
+            except Exception:
+                global_logger.exception("Failed to flush event logger handler.")
 
 
 def _build_event_file_logger(source: Event.SourceType, sink_dir: str):
@@ -138,6 +141,9 @@ def get_event_logger(source: Event.SourceType, sink_dir: str):
     Args:
         source: The source of the event.
         sink_dir: The directory to sink event logs.
+
+    Returns:
+        The event logger adapter for the given source.
     """
     with _event_logger_lock:
         global _event_logger

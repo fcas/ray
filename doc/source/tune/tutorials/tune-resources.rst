@@ -1,3 +1,6 @@
+.. meta::
+   :description: Control Tune parallelism and resources: request GPUs per trial, run distributed training inside trials, and limit trial concurrency.
+
 .. _tune-parallelism:
 
 A Guide To Parallelism and Resources for Ray Tune
@@ -53,7 +56,7 @@ object. In either case, Ray Tune will try to start a placement group for each tr
     # Custom resource allocation via lambda functions are also supported.
     # If you want to allocate gpu resources to trials based on a setting in your config
     trainable_with_resources = tune.with_resources(trainable,
-        resources=lambda spec: {"gpu": 1} if spec.config.use_gpu else {"gpu": 0})
+        resources=lambda config: {"gpu": 1} if config["use_gpu"] else {"gpu": 0})
     tuner = tune.Tuner(
         trainable_with_resources,
         tune_config=tune.TuneConfig(num_samples=10)
@@ -64,9 +67,6 @@ object. In either case, Ray Tune will try to start a placement group for each tr
 Tune will allocate the specified GPU and CPU as specified by ``tune.with_resources`` to each individual trial.
 Even if the trial cannot be scheduled right now, Ray Tune will still try to start the respective placement group. If not enough resources are available, this will trigger
 :ref:`autoscaling behavior <cluster-index>` if you're using the Ray cluster launcher.
-
-.. warning::
-    ``tune.with_resources`` cannot be used with :ref:`Ray Train Trainers <train-docs>`. If you are passing a Trainer to a Tuner, specify the resource requirements in the Trainer instance using :class:`~ray.train.ScalingConfig`. The general principles outlined below still apply.
 
 It is also possible to specify memory (``"memory"``, in bytes) and custom resource requirements.
 
@@ -133,7 +133,7 @@ Note that actual parallelism can be less than `max_concurrent_trials` and will b
 can fit in the cluster at once (i.e., if you have a trial that requires 16 GPUs, your cluster has 32 GPUs,
 and `max_concurrent_trials=10`, the `Tuner` can only run 2 trials concurrently).
 
-.. code-block:: python 
+.. code-block:: python
 
     from ray.tune import TuneConfig
 

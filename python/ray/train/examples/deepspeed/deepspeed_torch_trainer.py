@@ -159,7 +159,7 @@ if __name__ == "__main__":
     }
 
     # Prepare Ray Datasets
-    hf_datasets = load_dataset("glue", "mrpc")
+    hf_datasets = load_dataset("nyu-mll/glue", "mrpc")
     ray_datasets = {
         "train": ray.data.from_huggingface(hf_datasets["train"]),
         "validation": ray.data.from_huggingface(hf_datasets["validation"]),
@@ -180,6 +180,6 @@ if __name__ == "__main__":
     result = trainer.fit()
 
     # Retrieve the best checkponints from results
-    result.best_checkpoints
+    _ = result.best_checkpoints
 
 # __deepspeed_torch_basic_example_end__

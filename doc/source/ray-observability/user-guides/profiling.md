@@ -1,7 +1,12 @@
+---
+myst:
+  html_meta:
+    description: "Profile Ray applications for CPU, memory, and GPU bottlenecks using py-spy, cProfile, memray, and the PyTorch profiler from the dashboard."
+---
+
 (profiling)=
 # Profiling
-Profiling is one of the most important debugging tools to diagnose performance, out of memory, hanging, or other application issues.
-Here is a list of common profiling tools you may use when debugging Ray applications. 
+Profiling is one of the most important debugging tools to diagnose performance, out of memory, hanging, or other application issues. Here is a list of common profiling tools you may use when debugging Ray applications.
 - CPU profiling
     - py-spy
 - Memory profiling
@@ -9,9 +14,26 @@ Here is a list of common profiling tools you may use when debugging Ray applicat
 - GPU profiling
     - PyTorch Profiler
     - Nsight System
+- TPU profiling
+    - JAX Profiler
 - Ray Task / Actor timeline
 
 If Ray doesn't work with certain profiling tools, try running them without Ray to debug the issues.
+
+(profiling-enabling)=
+## Enabling dashboard profiling
+
+The Ray Dashboard's built-in profiling features (CPU flame graphs, stack traces, and memory profiling) are disabled by default for security reasons. These endpoints trigger profiling work on Ray workers on demand and return the results. On deployments where the dashboard is exposed without authentication, a malicious web page could exploit DNS rebinding to reach these endpoints from a browser.
+
+To enable dashboard profiling, set the following environment variable on the Ray head node before starting Ray:
+
+```bash
+export RAY_DASHBOARD_ENABLE_PROFILING=1
+```
+
+:::{warning}
+If your dashboard is accessible over a network without authentication, enabling profiling exposes side-effecting endpoints to potential abuse. Enable {ref}`token authentication <token-auth>` when using profiling on an exposed dashboard.
+:::
 
 (profiling-cpu)=
 ## CPU profiling
@@ -89,6 +111,7 @@ $ nsys --version
 # NVIDIA Nsight Systems version 2022.4.1.21-0db2c85
 ```
 
+(run-nsight-on-ray)=
 #### Run Nsight on Ray
 
 To enable GPU profiling, specify the config in the `runtime_env` as follows:
@@ -101,12 +124,12 @@ ray.init()
 
 @ray.remote(num_gpus=1, runtime_env={ "nsight": "default"})
 class RayActor:
-    def run():
-    a = torch.tensor([1.0, 2.0, 3.0]).cuda()
-    b = torch.tensor([4.0, 5.0, 6.0]).cuda()
-    c = a * b
+    def run(self):
+        a = torch.tensor([1.0, 2.0, 3.0]).cuda()
+        b = torch.tensor([4.0, 5.0, 6.0]).cuda()
+        c = a * b
 
-    print("Result on GPU:", c)
+        print("Result on GPU:", c)
 
 ray_actor = RayActor.remote()
 # The Actor or Task process runs with : "nsys profile [default options] ..."
@@ -117,7 +140,7 @@ You can find the `"default"` config in [nsight.py](https://github.com/ray-projec
 
 #### Custom options
 
-You can also add [custom options](https://docs.nvidia.com/nsight-systems/UserGuide/index.html#cli-profile-command-switch-options) for Nsight System Profiler by specifying a dictionary of option values, which overwrites the `default` config, however, Ray preserves the the `--output` option of the default config.
+You can also add [custom options](https://docs.nvidia.com/nsight-systems/UserGuide/index.html#cli-profile-command-switch-options) for Nsight System Profiler by specifying a dictionary of option values, which overwrites the `default` config, however, Ray preserves the `--output` option of the default config.
 
 
 ```python
@@ -134,12 +157,12 @@ runtime_env={ "nsight": {
     "cuda-graph-trace": "graph",
 }})
 class RayActor:
-    def run():
-    a = torch.tensor([1.0, 2.0, 3.0]).cuda()
-    b = torch.tensor([4.0, 5.0, 6.0]).cuda()
-    c = a * b
+    def run(self):
+        a = torch.tensor([1.0, 2.0, 3.0]).cuda()
+        b = torch.tensor([4.0, 5.0, 6.0]).cuda()
+        c = a * b
 
-    print("Result on GPU:", c)
+        print("Result on GPU:", c)
 
 ray_actor = RayActor.remote()
 
@@ -150,7 +173,7 @@ ray.get(ray_actor.run.remote())
 
 **Note:**: The default report filename (`-o, --output`) is `worker_process_{pid}.nsys-rep` in the logs dir.
 
-
+(profiling-result)=
 #### Profiling result
 
 Find profiling results under the `/tmp/ray/session_*/logs/{profiler_name}` directory. This specific directory location may change in the future. You can download the profiling reports from the {ref}`Ray Dashboard <dash-logs-view>`.
@@ -167,6 +190,10 @@ To visualize the results, install the [Nsight System GUI](https://developer.nvid
 ```
 The best practice is to only specify the filename in output option.
 
+
+(profiling-tpu)=
+## TPU profiling
+Profile TPU workloads with the JAX profiler. Trigger a JAX profile dynamically through the Ray Dashboard, then view the trace in TensorBoard. For the full walkthrough on Kubernetes, see {ref}`jax-tpu-profiling`.
 
 (profiling-timeline)=
 ## Ray Task or Actor timeline

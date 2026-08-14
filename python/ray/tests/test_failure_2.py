@@ -1,23 +1,21 @@
 import os
 import signal
 import sys
-import threading
 import time
 
-import numpy as np
 import pytest
 
 import ray
 import ray._private.ray_constants as ray_constants
 import ray._private.utils
+from ray._common.network_utils import parse_address
+from ray._common.test_utils import Semaphore, wait_for_condition
 from ray._private.ray_constants import DEBUG_AUTOSCALING_ERROR
 from ray._private.test_utils import (
-    Semaphore,
     get_error_message,
     get_log_batch,
     init_error_pubsub,
     run_string_as_driver_nonblocking,
-    wait_for_condition,
 )
 from ray.cluster_utils import cluster_not_supported
 from ray.experimental.internal_kv import _internal_kv_get
@@ -153,59 +151,6 @@ def test_warning_for_dead_autoscaler(ray_start_regular, error_pubsub):
     # Confirm that the autoscaler failure error is stored.
     error = _internal_kv_get(DEBUG_AUTOSCALING_ERROR)
     assert error is not None
-
-
-def test_raylet_crash_when_get(ray_start_regular):
-    def sleep_to_kill_raylet():
-        # Don't kill raylet before default workers get connected.
-        time.sleep(2)
-        ray._private.worker._global_node.kill_raylet()
-
-    object_ref = ray.put(np.zeros(200 * 1024, dtype=np.uint8))
-    ray._private.internal_api.free(object_ref)
-
-    thread = threading.Thread(target=sleep_to_kill_raylet)
-    thread.start()
-    with pytest.raises(ray.exceptions.ObjectFreedError):
-        ray.get(object_ref)
-    thread.join()
-
-
-@pytest.mark.parametrize(
-    "ray_start_cluster",
-    [
-        {
-            "num_nodes": 1,
-            "num_cpus": 2,
-        },
-        {
-            "num_nodes": 2,
-            "num_cpus": 1,
-        },
-    ],
-    indirect=True,
-)
-def test_eviction(ray_start_cluster):
-    @ray.remote
-    def large_object():
-        return np.zeros(10 * 1024 * 1024)
-
-    obj = large_object.remote()
-    assert isinstance(ray.get(obj), np.ndarray)
-    # Evict the object.
-    ray._private.internal_api.free([obj])
-    # ray.get throws an exception.
-    with pytest.raises(ray.exceptions.ObjectFreedError):
-        ray.get(obj)
-
-    @ray.remote
-    def dependent_task(x):
-        return
-
-    # If the object is passed by reference, the task throws an
-    # exception.
-    with pytest.raises(ray.exceptions.RayTaskError):
-        ray.get(dependent_task.remote(obj))
 
 
 @pytest.mark.parametrize(
@@ -362,7 +307,8 @@ def test_list_named_actors_timeout(monkeypatch, shutdown_only):
 
 def test_raylet_node_manager_server_failure(ray_start_cluster_head, log_pubsub):
     cluster = ray_start_cluster_head
-    redis_port = int(cluster.address.split(":")[1])
+    _, redis_port = parse_address(cluster.address)
+    redis_port = int(redis_port)
     # Reuse redis port to make node manager grpc server fail to start.
     with pytest.raises(Exception):
         cluster.add_node(wait=False, node_manager_port=redis_port)
@@ -418,9 +364,4 @@ time.sleep(60)
 
 
 if __name__ == "__main__":
-    import pytest
-
-    if os.environ.get("PARALLEL_CI"):
-        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
-    else:
-        sys.exit(pytest.main(["-sv", __file__]))
+    sys.exit(pytest.main(["-sv", __file__]))

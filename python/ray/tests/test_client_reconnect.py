@@ -1,22 +1,21 @@
-from concurrent import futures
 import contextlib
 import os
-import threading
-import sys
-import grpc
-from mock import Mock
-import numpy as np
-
-import time
 import random
-import pytest
+import sys
+import threading
+import time
+from concurrent import futures
 from typing import Any, Callable, Optional
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+
+import grpc
+import numpy as np
+import pytest
 
 import ray
-from ray._private.utils import get_or_create_event_loop
 import ray.core.generated.ray_client_pb2 as ray_client_pb2
 import ray.core.generated.ray_client_pb2_grpc as ray_client_pb2_grpc
+from ray._common.utils import get_or_create_event_loop
 from ray.tests.conftest import call_ray_start_context
 from ray.util.client.common import CLIENT_SERVER_MAX_THREADS, GRPC_OPTIONS
 
@@ -51,10 +50,13 @@ class MiddlemanDataServicer(ray_client_pb2_grpc.RayletDataStreamerServicer):
     def __init__(
         self, on_response: Optional[Hook] = None, on_request: Optional[Hook] = None
     ):
-        """
+        """Initialize the middleman data servicer.
+
         Args:
             on_response: Optional hook to inject errors before sending back a
-                response
+                response.
+            on_request: Optional hook to inject errors before forwarding a
+                request.
         """
         self.stub = None
         self.on_response = on_response
@@ -89,10 +91,11 @@ class MiddlemanLogServicer(ray_client_pb2_grpc.RayletLogStreamerServicer):
     """
 
     def __init__(self, on_response: Optional[Hook] = None):
-        """
+        """Initialize the middleman log servicer.
+
         Args:
             on_response: Optional hook to inject errors before sending back a
-                response
+                response.
         """
         self.stub = None
         self.on_response = on_response
@@ -122,12 +125,13 @@ class MiddlemanRayletServicer(ray_client_pb2_grpc.RayletDriverServicer):
     def __init__(
         self, on_request: Optional[Hook] = None, on_response: Optional[Hook] = None
     ):
-        """
+        """Initialize the middleman raylet servicer.
+
         Args:
             on_request: Optional hook to inject errors before forwarding a
-                request
+                request.
             on_response: Optional hook to inject errors before sending back a
-                response
+                response.
         """
         self.stub = None
         self.on_request = on_request
@@ -225,25 +229,28 @@ class MiddlemanServer:
     def __init__(
         self,
         listen_addr: str,
-        real_addr,
+        real_addr: str,
         on_log_response: Optional[Hook] = None,
         on_data_request: Optional[Hook] = None,
         on_data_response: Optional[Hook] = None,
         on_task_request: Optional[Hook] = None,
         on_task_response: Optional[Hook] = None,
     ):
-        """
+        """Initialize the middleman server.
+
         Args:
-            listen_addr: The address the middleman server will listen on
-            real_addr: The address of the real ray server
+            listen_addr: The address the middleman server will listen on.
+            real_addr: The address of the real ray server.
             on_log_response: Optional hook to inject errors before sending back
-                a log response
+                a log response.
+            on_data_request: Optional hook to inject errors before forwarding
+                a data request.
             on_data_response: Optional hook to inject errors before sending
-                back a data response
+                back a data response.
             on_task_request: Optional hook to inject errors before forwarding
-                a raylet driver request
+                a raylet driver request.
             on_task_response: Optional hook to inject errors before sending
-                back a raylet driver response
+                back a raylet driver response.
         """
         self.listen_addr = listen_addr
         self.real_addr = real_addr
@@ -585,7 +592,4 @@ def test_client_reconnect_grace_period(call_ray_start_shared):
 
 
 if __name__ == "__main__":
-    if os.environ.get("PARALLEL_CI"):
-        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
-    else:
-        sys.exit(pytest.main(["-sv", __file__]))
+    sys.exit(pytest.main(["-sv", __file__]))

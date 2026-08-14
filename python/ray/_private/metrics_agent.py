@@ -5,38 +5,44 @@ import re
 import threading
 import time
 import traceback
-from collections import namedtuple
-from typing import List, Tuple, Any, Dict, Set
+from collections import defaultdict, namedtuple
+from typing import Any, Dict, List, Set, Tuple, Union
 
-from prometheus_client.core import (
-    CounterMetricFamily,
-    GaugeMetricFamily,
-    HistogramMetricFamily,
-)
-from opencensus.metrics.export.value import ValueDouble
 from opencensus.metrics.export.metric_descriptor import MetricDescriptorType
-from opencensus.stats import aggregation
-from opencensus.stats import measure as measure_module
-from opencensus.stats.view_manager import ViewManager
-from opencensus.stats.stats_recorder import StatsRecorder
-from opencensus.stats.base_exporter import StatsExporter
-from prometheus_client.core import Metric as PrometheusMetric
+from opencensus.metrics.export.value import ValueDouble
+from opencensus.stats import aggregation, measure as measure_module
 from opencensus.stats.aggregation_data import (
     CountAggregationData,
     DistributionAggregationData,
     LastValueAggregationData,
     SumAggregationData,
 )
+from opencensus.stats.base_exporter import StatsExporter
+from opencensus.stats.stats_recorder import StatsRecorder
 from opencensus.stats.view import View
-from opencensus.tags import tag_key as tag_key_module
-from opencensus.tags import tag_map as tag_map_module
-from opencensus.tags import tag_value as tag_value_module
+from opencensus.stats.view_manager import ViewManager
+from opencensus.tags import (
+    tag_key as tag_key_module,
+    tag_map as tag_map_module,
+    tag_value as tag_value_module,
+)
+from prometheus_client.core import (
+    CounterMetricFamily,
+    GaugeMetricFamily,
+    HistogramMetricFamily,
+    Metric as PrometheusMetric,
+)
 
 import ray
-from ray._raylet import GcsClient
-
-from ray.core.generated.metrics_pb2 import Metric
+from ray._common.network_utils import build_address
 from ray._private.ray_constants import env_bool
+from ray._private.telemetry.metric_cardinality import (
+    WORKER_ID_TAG_KEY,
+    MetricCardinality,
+)
+from ray._raylet import GcsClient
+from ray.core.generated.metrics_pb2 import Metric
+from ray.util.metrics import _is_invalid_metric_name
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +62,15 @@ class Gauge(View):
     """
 
     def __init__(self, name, description, unit, tags: List[str]):
+        if _is_invalid_metric_name(name):
+            raise ValueError(
+                f"Invalid metric name: {name}. Metric will be discarded "
+                "and data will not be collected or published. "
+                "Metric names can only contain letters, numbers, _, and :. "
+                "Metric names cannot start with numbers."
+            )
         self._measure = measure_module.MeasureInt(name, description, unit)
+        self._description = description
         tags = [tag_key_module.TagKey(tag) for tag in tags]
         self._view = View(
             name, description, tags, self.measure, aggregation.LastValueAggregation()
@@ -73,6 +87,10 @@ class Gauge(View):
     @property
     def name(self):
         return self.measure.name
+
+    @property
+    def description(self):
+        return self._description
 
 
 Record = namedtuple("Record", ["gauge", "value", "tags"])
@@ -147,6 +165,21 @@ class OpencensusProxyMetric:
     @property
     def data(self):
         return self._data
+
+    def is_distribution_aggregation_data(self):
+        """Check if the metric is a distribution aggreation metric."""
+        return len(self._data) > 0 and isinstance(
+            next(iter(self._data.values())), DistributionAggregationData
+        )
+
+    def add_data(self, label_values: Tuple, data: Any):
+        """Add the data to the metric.
+
+        Args:
+            label_values: The label values of the metric.
+            data: The data to be added.
+        """
+        self._data[label_values] = data
 
     def record(self, metric: Metric):
         """Parse the Opencensus Protobuf and store the data.
@@ -252,6 +285,9 @@ class OpenCensusProxyCollector:
 
         Args:
             namespace: Prometheus namespace.
+            component_timeout_s: Number of seconds after which a component
+                without new reports is considered stale and its metrics are
+                no longer exported.
         """
         # -- Protect `self._components` --
         self._components_lock = threading.Lock()
@@ -310,7 +346,7 @@ class OpenCensusProxyCollector:
             return stale_components
 
     # TODO(sang): add start and end timestamp
-    def to_metrics(
+    def to_prometheus_metrics(
         self,
         metric_name: str,
         metric_description: str,
@@ -319,7 +355,7 @@ class OpenCensusProxyCollector:
         label_values: Tuple[tag_value_module.TagValue],
         agg_data: Any,
         metrics_map: Dict[str, List[PrometheusMetric]],
-    ):
+    ) -> None:
         """to_metric translate the data that OpenCensus create
         to Prometheus format, using Prometheus Metric object.
 
@@ -405,7 +441,6 @@ class OpenCensusProxyCollector:
             return
 
         elif isinstance(agg_data, DistributionAggregationData):
-
             assert agg_data.bounds == sorted(agg_data.bounds)
             # buckets are a list of buckets. Each bucket is another list with
             # a pair of bucket name and value, or a triple of bucket name,
@@ -452,6 +487,87 @@ class OpenCensusProxyCollector:
         else:
             raise ValueError(f"unsupported aggregation type {type(agg_data)}")
 
+    def _aggregate_metric_data(
+        self,
+        datas: List[
+            Union[LastValueAggregationData, CountAggregationData, SumAggregationData]
+        ],
+    ) -> Union[LastValueAggregationData, CountAggregationData, SumAggregationData]:
+        assert len(datas) > 0
+        sample = datas[0]
+        if isinstance(sample, LastValueAggregationData):
+            return LastValueAggregationData(
+                ValueDouble, sum([data.value for data in datas])
+            )
+        if isinstance(sample, CountAggregationData):
+            return CountAggregationData(sum([data.count_data for data in datas]))
+        if isinstance(sample, SumAggregationData):
+            return SumAggregationData(
+                ValueDouble, sum([data.sum_data for data in datas])
+            )
+
+        raise ValueError(
+            f"Unsupported aggregation type {type(sample)}. "
+            "Supported types are "
+            f"{CountAggregationData}, {LastValueAggregationData}, {SumAggregationData}."
+            f"Got {datas}."
+        )
+
+    def _aggregate_with_recommended_cardinality(
+        self,
+        per_worker_metrics: List[OpencensusProxyMetric],
+    ) -> List[OpencensusProxyMetric]:
+        """Collect per-worker metrics, aggregate them into per-node metrics and convert
+        them to Prometheus format.
+
+        Args:
+            per_worker_metrics: A list of per-worker metrics for the same metric name.
+        Returns:
+            A list of per-node metrics for the same metric name, with the high
+            cardinality labels removed and the values aggregated.
+        """
+        metric = next(iter(per_worker_metrics), None)
+        if not metric or WORKER_ID_TAG_KEY not in metric.label_keys:
+            # No high cardinality labels, return the original metrics.
+            return per_worker_metrics
+
+        worker_id_label_index = metric.label_keys.index(WORKER_ID_TAG_KEY)
+        # map from the tuple of label values without worker_id to the list of per worker
+        # task metrics
+        label_value_to_data: Dict[
+            Tuple,
+            List[
+                Union[
+                    LastValueAggregationData,
+                    CountAggregationData,
+                    SumAggregationData,
+                ]
+            ],
+        ] = defaultdict(list)
+        for metric in per_worker_metrics:
+            for label_values, data in metric.data.items():
+                # remove the worker_id from the label values
+                label_value_to_data[
+                    label_values[:worker_id_label_index]
+                    + label_values[worker_id_label_index + 1 :]
+                ].append(data)
+
+        aggregated_metric = OpencensusProxyMetric(
+            name=metric.name,
+            desc=metric.desc,
+            unit=metric.unit,
+            # remove the worker_id from the label keys
+            label_keys=metric.label_keys[:worker_id_label_index]
+            + metric.label_keys[worker_id_label_index + 1 :],
+        )
+        for label_values, datas in label_value_to_data.items():
+            aggregated_metric.add_data(
+                label_values,
+                self._aggregate_metric_data(datas),
+            )
+
+        return [aggregated_metric]
+
     def collect(self):  # pragma: NO COVER
         """Collect fetches the statistics from OpenCensus
         and delivers them as Prometheus Metrics.
@@ -461,21 +577,52 @@ class OpenCensusProxyCollector:
         This method is required as a Prometheus Collector.
         """
         with self._components_lock:
-            metrics_map = {}
+            # First construct the list of opencensus metrics to be converted to
+            # prometheus metrics.  For LEGACY cardinality level, this comprises all
+            # metrics from all components.  For RECOMMENDED cardinality level, we need
+            # to remove the high cardinality labels and aggreate the component metrics.
+            open_cencus_metrics: List[OpencensusProxyMetric] = []
+            # The metrics that need to be aggregated with recommended cardinality. Key
+            # is the metric name and value is the list of per-worker metrics.
+            to_lower_cardinality: Dict[str, List[OpencensusProxyMetric]] = defaultdict(
+                list
+            )
+            cardinality_level = MetricCardinality.get_cardinality_level()
             for component in self._components.values():
                 for metric in component.metrics.values():
-                    for label_values, data in metric.data.items():
-                        self.to_metrics(
-                            metric.name,
-                            metric.desc,
-                            metric.label_keys,
-                            metric.unit,
-                            label_values,
-                            data,
-                            metrics_map,
-                        )
+                    if (
+                        cardinality_level == MetricCardinality.RECOMMENDED
+                        and not metric.is_distribution_aggregation_data()
+                    ):
+                        # We reduce the cardinality for all metrics except for histogram
+                        # metrics. The aggregation of histogram metrics from worker
+                        # level to node level is not well defined. In addition, we
+                        # currently have very few histogram metrics in Ray
+                        # so the impact of them is negligible.
+                        to_lower_cardinality[metric.name].append(metric)
+                    else:
+                        open_cencus_metrics.append(metric)
+            for per_worker_metrics in to_lower_cardinality.values():
+                open_cencus_metrics.extend(
+                    self._aggregate_with_recommended_cardinality(
+                        per_worker_metrics,
+                    )
+                )
 
-        for metrics in metrics_map.values():
+            prometheus_metrics_map = {}
+            for metric in open_cencus_metrics:
+                for label_values, data in metric.data.items():
+                    self.to_prometheus_metrics(
+                        metric.name,
+                        metric.desc,
+                        metric.label_keys,
+                        metric.unit,
+                        label_values,
+                        data,
+                        prometheus_metrics_map,
+                    )
+
+        for metrics in prometheus_metrics_map.values():
             for metric in metrics:
                 yield metric
 
@@ -541,7 +688,12 @@ class MetricsAgent:
                 gauge = record.gauge
                 value = record.value
                 tags = record.tags
-                self._record_gauge(gauge, value, {**tags, **global_tags})
+                try:
+                    self._record_gauge(gauge, value, {**tags, **global_tags})
+                except Exception as e:
+                    logger.error(
+                        f"Failed to record metric {gauge.name} with value {value} with tags {tags!r} and global tags {global_tags!r} due to: {e!r}"
+                    )
 
     def _record_gauge(self, gauge: Gauge, value: float, tags: dict):
         if gauge.name not in self._registered_views:
@@ -550,8 +702,20 @@ class MetricsAgent:
         measurement_map = self.stats_recorder.new_measurement_map()
         tag_map = tag_map_module.TagMap()
         for key, tag_val in tags.items():
-            tag_key = tag_key_module.TagKey(key)
-            tag_value = tag_value_module.TagValue(tag_val)
+            try:
+                tag_key = tag_key_module.TagKey(key)
+            except ValueError as e:
+                logger.error(
+                    f"Failed to create tag key {key} for metric {gauge.name} due to: {e!r}"
+                )
+                raise e
+            try:
+                tag_value = tag_value_module.TagValue(tag_val)
+            except ValueError as e:
+                logger.error(
+                    f"Failed to create tag value {tag_val} for key {key} for metric {gauge.name} due to: {e!r}"
+                )
+                raise e
             tag_map.insert(tag_key, tag_value)
         measurement_map.measure_float_put(gauge.measure, value)
         # NOTE: When we record this metric, timestamp will be renewed.
@@ -567,6 +731,9 @@ class MetricsAgent:
             metrics: A list of protobuf Metric defined from OpenCensus.
             worker_id_hex: The worker ID it proxies metrics export. None
                 if the metric is not from a worker (i.e., raylet, GCS).
+
+        Returns:
+            None.
         """
         with self._lock:
             if not self.view_manager:
@@ -602,22 +769,47 @@ class PrometheusServiceDiscoveryWriter(threading.Thread):
         gcs_address: Gcs address for this cluster.
         temp_dir: Temporary directory used by
             Ray to store logs and metadata.
+        session_dir: Session-specific directory for this Ray session.
+            If provided, the discovery file is written here instead of
+            temp_dir, and a backward-compatible symlink is created at
+            the old temp_dir location.
     """
 
-    def __init__(self, gcs_address, temp_dir):
-        gcs_client_options = ray._raylet.GcsClientOptions.from_gcs_address(gcs_address)
+    def __init__(self, gcs_address: str, temp_dir: str, session_dir: str = None):
+        gcs_client_options = ray._raylet.GcsClientOptions.create(
+            gcs_address, None, allow_cluster_id_nil=True, fetch_cluster_id_if_nil=False
+        )
         self.gcs_address = gcs_address
 
         ray._private.state.state._initialize_global_state(gcs_client_options)
         self.temp_dir = temp_dir
+        self.session_dir = session_dir if session_dir else temp_dir
+        # Tracks whether the backward-compatible symlink has been successfully created.
+        # This prevents recreating the symlink on every periodic write, avoiding
+        # unnecessary disk I/O, race conditions, and log flooding.
+        self._symlink_created = False
+        # If symlink creation fails (e.g., due to lack of permissions on Windows
+        # without developer mode, or restricted filesystems), this fallback flag is set
+        # to True. When True, the writer copies the file directly instead of symlinking.
+        self._use_fallback_copy = False
         self.default_service_discovery_flush_period = 5
+
+        # The last service discovery content that PrometheusServiceDiscoveryWriter has seen
+        self.latest_service_discovery_content = []
+        self._content_lock = threading.RLock()
+
         super().__init__()
+
+    def get_latest_service_discovery_content(self):
+        """Return the latest stored service discovery content."""
+        with self._content_lock:
+            return self.latest_service_discovery_content
 
     def get_file_discovery_content(self):
         """Return the content for Prometheus service discovery."""
         nodes = ray.nodes()
         metrics_export_addresses = [
-            "{}:{}".format(node["NodeManagerAddress"], node["MetricsExportPort"])
+            build_address(node["NodeManagerAddress"], node["MetricsExportPort"])
             for node in nodes
             if node["alive"] is True
         ]
@@ -628,9 +820,10 @@ class PrometheusServiceDiscoveryWriter(threading.Thread):
         dashboard_addr = gcs_client.internal_kv_get(b"DashboardMetricsAddress", None)
         if dashboard_addr:
             metrics_export_addresses.append(dashboard_addr.decode("utf-8"))
-        return json.dumps(
-            [{"labels": {"job": "ray"}, "targets": metrics_export_addresses}]
-        )
+        content = [{"labels": {"job": "ray"}, "targets": metrics_export_addresses}]
+        with self._content_lock:
+            self.latest_service_discovery_content = content
+        return json.dumps(content)
 
     def write(self):
         # Write a file based on https://prometheus.io/docs/guides/file-sd/
@@ -644,15 +837,59 @@ class PrometheusServiceDiscoveryWriter(threading.Thread):
         # NOTE: os.replace is atomic on both Linux and Windows, so we won't
         # have race condition reading this file.
         os.replace(temp_file_name, self.get_target_file_name())
+        # Create a backward-compatible symlink at the old temp_dir location
+        # so that existing Prometheus configurations that reference the old
+        # path continue to work. Verify if the symlink is still valid and
+        # pointing to the correct target, repairing it if it has been deleted or modified.
+        if self.session_dir != self.temp_dir:
+            legacy_path = os.path.join(
+                self.temp_dir,
+                ray._private.ray_constants.PROMETHEUS_SERVICE_DISCOVERY_FILE,
+            )
+            if self._symlink_created and not self._use_fallback_copy:
+                try:
+                    if not (
+                        os.path.islink(legacy_path)
+                        and os.readlink(legacy_path) == self.get_target_file_name()
+                    ):
+                        self._symlink_created = False
+                except OSError:
+                    self._symlink_created = False
+
+            if not self._symlink_created and not self._use_fallback_copy:
+                try:
+                    if os.path.islink(legacy_path) or os.path.exists(legacy_path):
+                        os.remove(legacy_path)
+                    os.symlink(self.get_target_file_name(), legacy_path)
+                    self._symlink_created = True
+                except OSError:
+                    logger.warning(
+                        f"Failed to create backward-compatible symlink at "
+                        f"{legacy_path}. Falling back to copying the service discovery file."
+                    )
+                    self._use_fallback_copy = True
+
+            if self._use_fallback_copy:
+                try:
+                    import shutil
+
+                    temp_legacy_path = legacy_path + ".tmp"
+                    shutil.copy(self.get_target_file_name(), temp_legacy_path)
+                    os.replace(temp_legacy_path, legacy_path)
+                except OSError as e:
+                    logger.warning(
+                        f"Failed to copy service discovery file to legacy path {legacy_path}: {e}"
+                    )
 
     def get_target_file_name(self):
         return os.path.join(
-            self.temp_dir, ray._private.ray_constants.PROMETHEUS_SERVICE_DISCOVERY_FILE
+            self.session_dir,
+            ray._private.ray_constants.PROMETHEUS_SERVICE_DISCOVERY_FILE,
         )
 
     def get_temp_file_name(self):
         return os.path.join(
-            self.temp_dir,
+            self.session_dir,
             "{}_{}".format(
                 "tmp", ray._private.ray_constants.PROMETHEUS_SERVICE_DISCOVERY_FILE
             ),
@@ -665,8 +902,9 @@ class PrometheusServiceDiscoveryWriter(threading.Thread):
                 self.write()
             except Exception as e:
                 logger.warning(
-                    "Writing a service discovery file, {},"
-                    "failed.".format(self.get_target_file_name())
+                    "Writing a service discovery file, {},failed.".format(
+                        self.get_target_file_name()
+                    )
                 )
                 logger.warning(traceback.format_exc())
                 logger.warning(f"Error message: {e}")

@@ -1,3 +1,6 @@
+.. meta::
+   :description: Configure persistent storage for Ray Train: cloud object storage, shared filesystems, local storage, fsspec, and S3-compatible backends.
+
 .. _persistent-storage-guide:
 
 .. _train-log-dir:
@@ -5,9 +8,7 @@
 Configuring Persistent Storage
 ==============================
 
-A Ray Train run produces a history of :ref:`reported metrics <train-monitoring-and-logging>`,
-:ref:`checkpoints <train-checkpointing>`, and :ref:`other artifacts <train-artifacts>`.
-You can configure these to be saved to a persistent storage location.
+A Ray Train run produces :ref:`checkpoints <train-checkpointing>` that can be saved to a persistent storage location.
 
 .. figure:: ../images/persistent_storage_checkpoint.png
     :align: center
@@ -17,72 +18,154 @@ You can configure these to be saved to a persistent storage location.
 
 **Ray Train expects all workers to be able to write files to the same persistent storage location.**
 Therefore, Ray Train requires some form of external persistent storage such as
-cloud storage (e.g., S3, GCS) or a shared filesystem (e.g., AWS EFS, Google Filestore, HDFS)
-for multi-node training.
+cloud object storage (for example, S3, GCS, or Azure Blob Storage) or a shared filesystem
+(for example, AWS EFS, Google Cloud Filestore, Azure Files, or HDFS) for multi-node training.
 
 Here are some capabilities that persistent storage enables:
 
 - **Checkpointing and fault tolerance**: Saving checkpoints to a persistent storage location
   allows you to resume training from the last checkpoint in case of a node failure.
   See :ref:`train-checkpointing` for a detailed guide on how to set up checkpointing.
-- **Post-experiment analysis**: A consolidated location storing data from all trials is useful for post-experiment analysis
-  such as accessing the best checkpoints and hyperparameter configs after the cluster has already been terminated.
+- **Post-experiment analysis**: A consolidated location storing data such as the best checkpoints and
+  hyperparameter configs after the Ray cluster has already been terminated.
 - **Bridge training/fine-tuning with downstream serving and batch inference tasks**: You can easily access the models
   and artifacts to share them with others or use them in downstream tasks.
 
 
-Cloud storage (AWS S3, Google Cloud Storage)
---------------------------------------------
+Cloud object storage
+--------------------
 
-.. tip::
+The Ray team recommends using cloud object storage such as S3, GCS, or Azure Blob Storage to persist Ray Train checkpoint files.
 
-    Cloud storage is the recommended persistent storage option.
+Use cloud object storage by specifying a storage container URI as the :class:`RunConfig(storage_path) <ray.train.RunConfig>`:
 
-Use cloud storage by specifying a bucket URI as the :class:`RunConfig(storage_path) <ray.train.RunConfig>`:
+.. tab-set::
 
-.. testcode::
-    :skipif: True
+    .. tab-item:: AWS S3
 
-    from ray import train
-    from ray.train.torch import TorchTrainer
+        Specify a URI with the ``s3://`` scheme. Ray Train uses pyarrow's default
+        :class:`S3FileSystem <pyarrow.fs.S3FileSystem>` for upload and download.
 
-    trainer = TorchTrainer(
-        ...,
-        run_config=train.RunConfig(
-            storage_path="s3://bucket-name/sub-path/",
-            name="experiment_name",
-        )
-    )
+        .. testcode::
+            :skipif: True
+
+            from ray import train
+            from ray.train.torch import TorchTrainer
+
+            trainer = TorchTrainer(
+                ...,
+                run_config=train.RunConfig(
+                    storage_path="s3://bucket-name/sub-path/",
+                    name="experiment_name",
+                )
+            )
+
+    .. tab-item:: Google Cloud Storage
+
+        Specify a URI with the ``gs://`` scheme. Ray Train uses pyarrow's default
+        :class:`GcsFileSystem <pyarrow.fs.GcsFileSystem>` for upload and download.
+
+        .. testcode::
+            :skipif: True
+
+            from ray import train
+            from ray.train.torch import TorchTrainer
+
+            trainer = TorchTrainer(
+                ...,
+                run_config=train.RunConfig(
+                    storage_path="gs://bucket-name/sub-path/",
+                    name="experiment_name",
+                )
+            )
+
+    .. tab-item:: Azure Blob Storage
+
+        Ray Train uses ``pyarrow.fs`` for storage I/O, so wrap
+        ``adlfs.AzureBlobFileSystem`` in a ``pyarrow.fs.PyFileSystem`` and pass
+        it as :class:`RunConfig(storage_filesystem) <ray.train.RunConfig>`.
+        Use the ``abfss://`` scheme (TLS-enforced) for the URI:
+
+        .. testcode::
+            :skipif: True
+
+            import adlfs
+            from pyarrow.fs import FSSpecHandler, PyFileSystem
+            from ray import train
+            from ray.train.torch import TorchTrainer
+
+            azure_fs = PyFileSystem(
+                FSSpecHandler(adlfs.AzureBlobFileSystem(account_name="account-name"))
+            )
+
+            trainer = TorchTrainer(
+                ...,
+                run_config=train.RunConfig(
+                    storage_filesystem=azure_fs,
+                    storage_path="abfss://container@account.dfs.core.windows.net/sub-path/",
+                    name="experiment_name",
+                )
+            )
+
+        See :ref:`custom-storage-filesystem` for more on ``storage_filesystem``.
 
 
-Ensure that all nodes in the Ray cluster have access to cloud storage, so outputs from workers can be uploaded to a shared cloud bucket.
-In this example, all files are uploaded to shared storage at ``s3://bucket-name/sub-path/experiment_name`` for further processing.
+Ensure that all nodes in the Ray cluster have access to the storage container, so outputs from workers can be uploaded to a shared location.
+In the AWS S3 example above, all files are uploaded to shared storage at ``s3://bucket-name/sub-path/experiment_name`` for further processing.
 
 
-Shared filesystem (NFS, HDFS)
------------------------------
+Shared filesystem
+-----------------
 
-Use by specifying the shared storage path as the :class:`RunConfig(storage_path) <ray.train.RunConfig>`:
+You can use shared filesystems such as AWS EFS, Google Cloud Filestore, Azure Files, HDFS, or NFS.
+Either mount the filesystem so that it appears at a common path on every node in the Ray cluster, or specify a fully qualified URI.
+In either case, ensure that networking rules and security permissions allow access from all nodes.
 
-.. testcode::
-    :skipif: True
+Specify the shared storage location as the :class:`RunConfig(storage_path) <ray.train.RunConfig>`:
 
-    from ray import train
-    from ray.train.torch import TorchTrainer
+.. tab-set::
 
-    trainer = TorchTrainer(
-        ...,
-        run_config=train.RunConfig(
-            storage_path="/mnt/cluster_storage",
-            # HDFS example:
-            # storage_path=f"hdfs://{hostname}:{port}/subpath",
-            name="experiment_name",
-        )
-    )
+    .. tab-item:: Mounted filesystem
 
-Ensure that all nodes in the Ray cluster have access to the shared filesystem, e.g. AWS EFS, Google Cloud Filestore, or HDFS,
-so that outputs can be saved to there.
-In this example, all files are saved to ``/mnt/cluster_storage/experiment_name`` for further processing.
+        Mount the filesystem on every node in the cluster, then point
+        ``storage_path`` at the mount. This works for AWS EFS, Google Cloud
+        Filestore, Azure Files, and NFS.
+
+        .. testcode::
+            :skipif: True
+
+            from ray import train
+            from ray.train.torch import TorchTrainer
+
+            trainer = TorchTrainer(
+                ...,
+                run_config=train.RunConfig(
+                    # Example for Azure Files mounted at /mnt/azure-fileshare on every node;
+                    # AWS EFS, Google Cloud Filestore, and NFS work the same way.
+                    storage_path="/mnt/cluster_storage",
+                    name="experiment_name",
+                )
+            )
+
+    .. tab-item:: HDFS
+
+        Specify a fully qualified ``hdfs://`` URI.
+
+        .. testcode::
+            :skipif: True
+
+            from ray import train
+            from ray.train.torch import TorchTrainer
+
+            trainer = TorchTrainer(
+                ...,
+                run_config=train.RunConfig(
+                    storage_path=f"hdfs://{hostname}:{port}/subpath",
+                    name="experiment_name",
+                )
+            )
+
+In the mounted example above, all files are saved to ``/mnt/cluster_storage/experiment_name`` for further processing.
 
 
 Local storage
@@ -179,7 +262,7 @@ Implement custom storage upload and download logic by providing an implementatio
         run_config=train.RunConfig(
             storage_filesystem=fs,
             storage_path="bucket-name/sub-path",
-            name="experiment_name",
+            name="unique-run-id",
         )
     )
 
@@ -217,13 +300,13 @@ You can use any of these implementations by wrapping the ``fsspec`` filesystem w
 
 
 
-MinIO and other S3-compatible storage
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+S3-compatible storage (Backblaze B2, MinIO, etc.)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-You can follow the :ref:`examples shown above <custom-storage-filesystem>` to configure
-a custom S3 filesystem to work with MinIO.
-
-Note that including these as query parameters in the ``storage_path`` URI directly is another option:
+For S3-compatible stores like `Backblaze B2 <https://www.backblaze.com/cloud-storage>`_
+or `MinIO <https://min.io/>`_, follow the
+:ref:`custom-filesystem examples above <custom-storage-filesystem>`, or pass
+the endpoint as a query parameter in the ``storage_path`` URI:
 
 .. testcode::
     :skipif: True
@@ -234,10 +317,22 @@ Note that including these as query parameters in the ``storage_path`` URI direct
     trainer = TorchTrainer(
         ...,
         run_config=train.RunConfig(
-            storage_path="s3://bucket-name/sub-path?endpoint_override=http://localhost:9000",
-            name="experiment_name",
+            # Backblaze B2 (substitute your bucket's region):
+            storage_path="s3://bucket-name/sub-path?endpoint_override=https://s3.us-west-001.backblazeb2.com",
+            # MinIO running locally:
+            # storage_path="s3://bucket-name/sub-path?endpoint_override=http://localhost:9000",
+            name="unique-run-id",
         )
     )
+
+Alternatively, configure the endpoint and credentials through the environment
+variables Arrow reads (see
+`Arrow's S3 environment variables <https://arrow.apache.org/docs/cpp/env_vars.html>`_)
+and use a plain ``storage_path="s3://bucket/path"``. For Backblaze B2, set
+``AWS_ENDPOINT_URL_S3`` to your bucket's endpoint, and ``AWS_ACCESS_KEY_ID`` /
+``AWS_SECRET_ACCESS_KEY`` to your B2 application key ID and key.
+
+See `this end-to-end notebook <https://github.com/backblaze-b2-samples/notebooks/tree/main/ray-train-tune-checkpoints>`_ for a worked Backblaze B2 example.
 
 
 Overview of Ray Train outputs
@@ -257,20 +352,14 @@ and how they're structured in storage.
     import os
     import tempfile
 
-    from ray import train
+    import ray.train
     from ray.train import Checkpoint
     from ray.train.torch import TorchTrainer
 
     def train_fn(config):
         for i in range(10):
             # Training logic here
-
             metrics = {"loss": ...}
-
-            # Save arbitrary artifacts to the working directory
-            rank = train.get_context().get_world_rank()
-            with open(f"artifact-rank={rank}-iter={i}.txt", "w") as f:
-                f.write("data")
 
             with tempfile.TemporaryDirectory() as temp_checkpoint_dir:
                 torch.save(..., os.path.join(temp_checkpoint_dir, "checkpoint.pt"))
@@ -281,11 +370,10 @@ and how they're structured in storage.
 
     trainer = TorchTrainer(
         train_fn,
-        scaling_config=train.ScalingConfig(num_workers=2),
-        run_config=train.RunConfig(
+        scaling_config=ray.train.ScalingConfig(num_workers=2),
+        run_config=ray.train.RunConfig(
             storage_path="s3://bucket-name/sub-path/",
-            name="experiment_name",
-            sync_config=train.SyncConfig(sync_artifacts=True),
+            name="unique-run-id",
         )
     )
     result: train.Result = trainer.fit()
@@ -295,21 +383,12 @@ Here's a rundown of all files that will be persisted to storage:
 
 .. code-block:: text
 
-    s3://bucket-name/sub-path (RunConfig.storage_path)
-    └── experiment_name (RunConfig.name)          <- The "experiment directory"
-        ├── experiment_state-*.json
-        ├── basic-variant-state-*.json
-        ├── trainer.pkl
-        ├── tuner.pkl
-        └── TorchTrainer_46367_00000_0_...        <- The "trial directory"
-            ├── events.out.tfevents...            <- Tensorboard logs of reported metrics
-            ├── result.json                       <- JSON log file of reported metrics
-            ├── checkpoint_000000/                <- Checkpoints
-            ├── checkpoint_000001/
-            ├── ...
-            ├── artifact-rank=0-iter=0.txt        <- Worker artifacts (see the next section)
-            ├── artifact-rank=1-iter=0.txt
-            └── ...
+    {RunConfig.storage_path}  (ex: "s3://bucket-name/sub-path/")
+    └── {RunConfig.name}      (ex: "unique-run-id")               <- Train run output directory
+        ├── *_snapshot.json                                       <- Train run metadata files (DeveloperAPI)
+        ├── checkpoint_epoch=0/                                   <- Checkpoints
+        ├── checkpoint_epoch=1/
+        └── ...
 
 The :class:`~ray.train.Result` and :class:`~ray.train.Checkpoint` objects returned by
 ``trainer.fit`` are the easiest way to access the data in these files:
@@ -318,19 +397,96 @@ The :class:`~ray.train.Result` and :class:`~ray.train.Checkpoint` objects return
     :skipif: True
 
     result.filesystem, result.path
-    # S3FileSystem, "bucket-name/sub-path/experiment_name/TorchTrainer_46367_00000_0_..."
+    # S3FileSystem, "bucket-name/sub-path/unique-run-id"
 
     result.checkpoint.filesystem, result.checkpoint.path
-    # S3FileSystem, "bucket-name/sub-path/experiment_name/TorchTrainer_46367_00000_0_.../checkpoint_000009"
+    # S3FileSystem, "bucket-name/sub-path/unique-run-id/checkpoint_epoch=0"
 
 
 See :ref:`train-inspect-results` for a full guide on interacting with training :class:`Results <ray.train.Result>`.
 
 
-.. _train-artifacts:
+.. _train-storage-advanced:
 
-Persisting training artifacts
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Advanced configuration
+----------------------
+
+.. _train-working-directory:
+
+Keep the original current working directory
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Ray Train changes the current working directory of each worker to the same path.
+
+By default, this path is a sub-directory of the Ray session directory (e.g., ``/tmp/ray/session_latest``),
+which is also where other Ray logs and temporary files are dumped.
+The location of the Ray session directory :ref:`can be customized <temp-dir-log-files>`.
+
+To disable the default behavior of Ray Train changing the current working directory,
+set the ``RAY_CHDIR_TO_TRIAL_DIR=0`` environment variable.
+
+This is useful if you want your training workers to access relative paths from the
+directory you launched the training script from.
+
+.. tip::
+
+    When running in a distributed cluster, you will need to make sure that all workers
+    have a mirrored working directory to access the same relative paths.
+
+    One way to achieve this is setting the
+    :ref:`working directory in the Ray runtime environment <workflow-local-files>`.
+
+.. testcode::
+
+    import os
+
+    import ray
+    import ray.train
+    from ray.train.torch import TorchTrainer
+
+    os.environ["RAY_CHDIR_TO_TRIAL_DIR"] = "0"
+
+    # Write some file in the current working directory
+    with open("./data.txt", "w") as f:
+        f.write("some data")
+
+    # Set the working directory in the Ray runtime environment
+    ray.init(runtime_env={"working_dir": "."})
+
+    def train_fn_per_worker(config):
+        # Check that each worker can access the working directory
+        # NOTE: The working directory is copied to each worker and is read only.
+        assert os.path.exists("./data.txt"), os.getcwd()
+
+    trainer = TorchTrainer(
+        train_fn_per_worker,
+        scaling_config=ray.train.ScalingConfig(num_workers=2),
+        run_config=ray.train.RunConfig(
+            # storage_path=...,
+        ),
+    )
+    trainer.fit()
+
+
+Deprecated
+----------
+
+The following sections describe behavior that is deprecated as of Ray 2.43 and will not be supported in Ray Train V2,
+which is an overhaul of Ray Train's implementation and select APIs.
+
+See the following resources for more information:
+
+* `Train V2 REP <https://github.com/ray-project/enhancements/blob/main/reps/2024-10-18-train-tune-api-revamp/2024-10-18-train-tune-api-revamp.md>`_: Technical details about the API change
+* `Train V2 Migration Guide <https://github.com/ray-project/ray/issues/49454>`_: Full migration guide for Train V2
+
+(Deprecated) Persisting training artifacts
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. note::
+    This feature of persisting training worker artifacts is deprecated as of Ray 2.43.
+    The feature relied on Ray Tune's local working directory abstraction,
+    where the local files of each worker would be copied to storage.
+    Ray Train V2 decouples the two libraries, so this API, which already provided limited value, has been deprecated.
 
 In the example above, we saved some artifacts within the training loop to the worker's
 *current working directory*.
@@ -349,12 +505,25 @@ all artifacts saved in this directory will be persisted to storage.
 The frequency of artifact syncing can be configured via :class:`SyncConfig <ray.train.SyncConfig>`.
 Note that this behavior is off by default.
 
-.. figure:: ../images/persistent_storage_artifacts.png
-    :align: center
-    :width: 600px
+Here's an example of what the Train run output directory looks like, with the worker artifacts:
 
-    Multiple workers spread across multiple nodes save artifacts to their local
-    working directory, which is then persisted to storage.
+.. code-block:: text
+
+    s3://bucket-name/sub-path (RunConfig.storage_path)
+    └── experiment_name (RunConfig.name)          <- The "experiment directory"
+        ├── experiment_state-*.json
+        ├── basic-variant-state-*.json
+        ├── trainer.pkl
+        ├── tuner.pkl
+        └── TorchTrainer_46367_00000_0_...        <- The "trial directory"
+            ├── events.out.tfevents...            <- Tensorboard logs of reported metrics
+            ├── result.json                       <- JSON log file of reported metrics
+            ├── checkpoint_000000/                <- Checkpoints
+            ├── checkpoint_000001/
+            ├── ...
+            ├── artifact-rank=0-iter=0.txt        <- Worker artifacts
+            ├── artifact-rank=1-iter=0.txt
+            └── ...
 
 .. warning::
 
@@ -378,16 +547,13 @@ Note that this behavior is off by default.
             # Every local rank 0 worker saves artifacts.
             ...
 
-
-.. _train-storage-advanced:
-
-Advanced configuration
-----------------------
-
 .. _train-local-staging-dir:
 
-Setting the local staging directory
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+(Deprecated) Setting the local staging directory
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. note::
+    This section describes behavior depending on Ray Tune implementation details that no longer applies to Ray Train V2.
 
 .. warning::
 
@@ -429,74 +595,3 @@ Here's an example of what the local staging directory looks like:
 
     The structure of the local staging directory is subject to change
     in future versions of Ray Train -- do not rely on these local staging files in your application.
-
-
-.. _train-working-directory:
-
-Keep the original current working directory
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-To disable the default behavior of Ray Train changing the current working directory,
-set the ``RAY_CHDIR_TO_TRIAL_DIR=0`` environment variable.
-
-This is useful if you want your training workers to access relative paths from the
-directory you launched the training script from.
-
-.. tip::
-
-    When running in a distributed cluster, you will need to make sure that all workers
-    have a mirrored working directory to access the same relative paths.
-
-    One way to achieve this is setting the
-    :ref:`working directory in the Ray runtime environment <workflow-local-files>`.
-
-.. testcode::
-
-    import os
-
-    import ray
-    import ray.train
-    from ray.train.torch import TorchTrainer
-
-    os.environ["RAY_CHDIR_TO_TRIAL_DIR"] = "0"
-
-    # Write some file in the current working directory
-    with open("./data.txt", "w") as f:
-        f.write("some data")
-
-    # Set the working directory in the Ray runtime environment
-    ray.init(runtime_env={"working_dir": "."})
-
-    def train_fn_per_worker(config):
-        # Check that each worker can access the working directory
-        # NOTE: The working directory is copied to each worker and is read only.
-        assert os.path.exists("./data.txt"), os.getcwd()
-
-        # To use artifact syncing with `SyncConfig(sync_artifacts=True)`,
-        # write artifacts here, instead of the current working directory:
-        ray.train.get_context().get_trial_dir()
-
-    trainer = TorchTrainer(
-        train_fn_per_worker,
-        scaling_config=ray.train.ScalingConfig(num_workers=2),
-        run_config=ray.train.RunConfig(
-            # storage_path=...,
-            sync_config=ray.train.SyncConfig(sync_artifacts=True),
-        ),
-    )
-    trainer.fit()
-
-
-.. _train-ray-storage:
-
-Automatically setting up persistent storage
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-You can control where to store training results with the ``RAY_STORAGE``
-environment variable.
-
-For instance, if you set ``RAY_STORAGE="s3://my_bucket/train_results"``, your
-results will automatically persisted there.
-
-If you manually set a :attr:`RunConfig.storage_path <ray.train.RunConfig.storage_path>`,
-it will take precedence over this environment variable.

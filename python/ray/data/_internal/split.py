@@ -1,9 +1,9 @@
 import itertools
 import logging
-from typing import Iterable, List, Tuple, Union
+from dataclasses import replace
+from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 import ray
-from ray.data._internal.block_list import BlockList
 from ray.data._internal.memory_tracing import trace_deallocation
 from ray.data._internal.remote_fn import cached_remote_fn
 from ray.data.block import (
@@ -28,7 +28,7 @@ def _calculate_blocks_rows(
         if metadata.num_rows is None:
             # Need to fetch number of rows.
             num_rows = ray.get(get_num_rows.remote(block))
-            metadata.num_rows = num_rows
+            metadata = replace(metadata, num_rows=num_rows)
         else:
             num_rows = metadata.num_rows
         block_rows.append(num_rows)
@@ -124,7 +124,6 @@ def _split_single_block(
         _meta = BlockMetadata(
             num_rows=accessor.num_rows(),
             size_bytes=accessor.size_bytes(),
-            schema=meta.schema,
             input_files=meta.input_files,
             exec_stats=stats.build(),
         )
@@ -156,7 +155,7 @@ def _drop_empty_block_split(block_split_indices: List[int], num_rows: int) -> Li
 def _split_all_blocks(
     blocks_with_metadata: List[Tuple[ObjectRef[Block], BlockMetadata]],
     per_block_split_indices: List[List[int]],
-    owned_by_consumer: bool,
+    label_selector: Optional[Dict[str, str]] = None,
 ) -> Iterable[Tuple[ObjectRef[Block], BlockMetadata]]:
     """Split all the input blocks based on the split indices"""
     split_single_block = cached_remote_fn(_split_single_block)
@@ -178,9 +177,13 @@ def _split_all_blocks(
             all_blocks_split_results[block_id] = [(block_ref, meta)]
         else:
             # otherwise call split remote function.
-            object_refs = split_single_block.options(
-                scheduling_strategy="SPREAD", num_returns=2 + len(block_split_indices)
-            ).remote(
+            options = {
+                "scheduling_strategy": "SPREAD",
+                "num_returns": 2 + len(block_split_indices),
+            }
+            if label_selector:
+                options["label_selector"] = label_selector
+            object_refs = split_single_block.options(**options).remote(
                 block_id,
                 block_ref,
                 meta,
@@ -200,15 +203,10 @@ def _split_all_blocks(
             assert len(meta) == len(block_refs)
             all_blocks_split_results[block_id] = zip(block_refs, meta)
 
-    # We make a copy for the blocks that have been splitted, so the input blocks
-    # can be cleared if they are owned by consumer (consumer-owned blocks will
-    # only be consumed by the owner).
-    if owned_by_consumer:
-        for b in blocks_splitted:
-            trace_deallocation(b, "split._split_all_blocks")
-    else:
-        for b in blocks_splitted:
-            trace_deallocation(b, "split._split_all_blocks", free=False)
+    # Record the deallocation of the original (now split) blocks for memory
+    # tracing. Reclamation is handled by Ray reference counting.
+    for b in blocks_splitted:
+        trace_deallocation(b, "split._split_all_blocks")
 
     return itertools.chain.from_iterable(all_blocks_split_results)
 
@@ -248,17 +246,17 @@ def _generate_global_split_results(
 def _split_at_indices(
     blocks_with_metadata: List[Tuple[ObjectRef[Block], BlockMetadata]],
     indices: List[int],
-    owned_by_consumer: bool = True,
     block_rows: List[int] = None,
+    label_selector: Optional[Dict[str, str]] = None,
 ) -> Tuple[List[List[ObjectRef[Block]]], List[List[BlockMetadata]]]:
     """Split blocks at the provided indices.
 
     Args:
         blocks_with_metadata: Block futures to split, including the associated metadata.
         indices: The (global) indices at which to split the blocks.
-        owned_by_consumer: Whether the provided blocks are owned by the consumer.
         block_rows: The number of rows for each block, in case it has already been
             computed.
+        label_selector: Optional label selector applied to the split remote tasks.
 
     Returns:
         The block split futures and their metadata. If an index split is empty, the
@@ -281,7 +279,9 @@ def _split_at_indices(
     all_blocks_split_results: Iterable[
         Tuple[ObjectRef[Block], BlockMetadata]
     ] = _split_all_blocks(
-        blocks_with_metadata, per_block_split_indices, owned_by_consumer
+        blocks_with_metadata,
+        per_block_split_indices,
+        label_selector=label_selector,
     )
 
     # phase 3: generate the final split.
@@ -296,25 +296,3 @@ def _split_at_indices(
 def _get_num_rows(block: Block) -> int:
     """Get the number of rows contained in the provided block."""
     return BlockAccessor.for_block(block).num_rows()
-
-
-def _split_at_index(
-    block_list: BlockList,
-    index: int,
-) -> Tuple[
-    List[ObjectRef[Block]],
-    List[BlockMetadata],
-    List[ObjectRef[Block]],
-    List[BlockMetadata],
-]:
-    """Split blocks at the provided index.
-    Args:
-        blocks_with_metadata: Block futures to split, including the associated metadata.
-        index: The (global) index at which to split the blocks.
-    Returns:
-        The block split futures and their metadata for left and right of the index.
-    """
-    blocks_splits, metadata_splits = _split_at_indices(
-        block_list.get_blocks_with_metadata(), [index], block_list._owned_by_consumer
-    )
-    return blocks_splits[0], metadata_splits[0], blocks_splits[1], metadata_splits[1]

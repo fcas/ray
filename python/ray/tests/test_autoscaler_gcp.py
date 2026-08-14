@@ -1,4 +1,5 @@
-from typing import List
+import sys
+from typing import List, Optional
 
 import pytest
 
@@ -44,7 +45,9 @@ B, V = BrokenPipeError, ValueError
         ([B, B, B, B, B, B, None], B),
     ],
 )
-def test_gcp_broken_pipe_retry(error_input, expected_error_raised):
+def test_gcp_broken_pipe_retry(
+    error_input: list, expected_error_raised: Optional[type]
+):
     """Tests retries of BrokenPipeError in GCPNodeProvider.
 
     Args:
@@ -63,10 +66,4 @@ def test_gcp_broken_pipe_retry(error_input, expected_error_raised):
 
 
 if __name__ == "__main__":
-    import os
-    import sys
-
-    if os.environ.get("PARALLEL_CI"):
-        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
-    else:
-        sys.exit(pytest.main(["-sv", __file__]))
+    sys.exit(pytest.main(["-sv", __file__]))

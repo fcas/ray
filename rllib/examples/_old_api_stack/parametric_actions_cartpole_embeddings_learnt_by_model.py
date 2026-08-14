@@ -1,4 +1,5 @@
-"""Example of handling variable length and/or parametric action spaces.
+# @OldAPIStack
+"""Example of handling variable length or parametric action spaces.
 
 This is a toy example of the action-embedding based approach for handling large
 discrete action spaces (potentially infinite in size), similar to this:
@@ -18,13 +19,12 @@ import argparse
 import os
 
 import ray
-from ray import air, tune
-from ray.air.constants import TRAINING_ITERATION
-from ray.rllib.examples.envs.classes.parametric_actions_cartpole import (
-    ParametricActionsCartPoleNoEmbeddings,
-)
+from ray import tune
 from ray.rllib.examples._old_api_stack.models.parametric_actions_model import (
     ParametricActionsModelThatLearnsEmbeddings,
+)
+from ray.rllib.examples.envs.classes.parametric_actions_cartpole import (
+    ParametricActionsCartPoleNoEmbeddings,
 )
 from ray.rllib.models import ModelCatalog
 from ray.rllib.utils.metrics import (
@@ -34,6 +34,7 @@ from ray.rllib.utils.metrics import (
 )
 from ray.rllib.utils.test_utils import check_learning_achieved
 from ray.tune.registry import register_env
+from ray.tune.result import TRAINING_ITERATION
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--run", type=str, default="PPO")
@@ -67,6 +68,8 @@ if __name__ == "__main__":
             # defined a custom DistributionalQModel that is aware of masking.
             "hiddens": [],
             "dueling": False,
+            "enable_rl_module_and_learner": False,
+            "enable_env_runner_and_connector_v2": False,
         }
     else:
         cfg = {}
@@ -94,7 +97,7 @@ if __name__ == "__main__":
 
     results = tune.Tuner(
         args.run,
-        run_config=air.RunConfig(stop=stop, verbose=2),
+        run_config=tune.RunConfig(stop=stop, verbose=2),
         param_space=config,
     ).fit()
 

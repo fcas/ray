@@ -18,7 +18,9 @@
 
 #include "../local_mode_ray_runtime.h"
 #include "object_store.h"
+#include "ray/asio/asio_util.h"
 #include "ray/core_worker/store_provider/memory_store/memory_store.h"
+#include "ray/util/clock.h"
 
 namespace ray {
 namespace internal {
@@ -27,7 +29,7 @@ using ray::core::CoreWorkerMemoryStore;
 
 class LocalModeObjectStore : public ObjectStore {
  public:
-  LocalModeObjectStore(LocalModeRayRuntime &local_mode_ray_tuntime);
+  explicit LocalModeObjectStore(LocalModeRayRuntime &local_mode_ray_tuntime);
 
   std::vector<bool> Wait(const std::vector<ObjectID> &ids,
                          int num_objects,
@@ -47,6 +49,8 @@ class LocalModeObjectStore : public ObjectStore {
   std::vector<std::shared_ptr<msgpack::sbuffer>> GetRaw(const std::vector<ObjectID> &ids,
                                                         int timeout_ms);
 
+  InstrumentedIOContextWithThread io_context_;
+  Clock clock_;
   std::unique_ptr<CoreWorkerMemoryStore> memory_store_;
 
   LocalModeRayRuntime &local_mode_ray_tuntime_;

@@ -1,7 +1,17 @@
 :orphan:
 
+.. meta::
+   :description: Runnable example of Horovod distributed training with PyTorch on Ray Train.
+
 Run Horovod Distributed Training with PyTorch and Ray Train
 ===========================================================
+
+.. raw:: html
+
+    <a id="try-anyscale-quickstart-horovod_example" target="_blank" href="https://console.anyscale.com/register/ha?render_flow=ray&utm_source=ray_docs&utm_medium=docs&utm_campaign=horovod_example">
+      <img src="../../../_static/img/run-on-anyscale.svg" alt="Run on Anyscale" />
+      <br/><br/>
+    </a>
 
 This basic example demonstrates how to run Horovod distributed training with PyTorch and Ray Train.
 

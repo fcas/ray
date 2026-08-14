@@ -20,7 +20,7 @@ class CommandRunnerInterface:
         cmd: Optional[str] = None,
         timeout: int = 120,
         exit_on_fail: bool = False,
-        port_forward: List[Tuple[int, int]] = None,
+        port_forward: Optional[List[Tuple[int, int]]] = None,
         with_output: bool = False,
         environment_variables: Optional[Dict[str, object]] = None,
         run_env: str = "auto",
@@ -39,14 +39,18 @@ class CommandRunnerInterface:
             port_forward: List of (local, remote) ports to forward, or
                 a single tuple.
             with_output: Whether to return output.
-            environment_variables (Dict[str, str | int | Dict[str, str]):
+            environment_variables:
                 Environment variables that `cmd` should be run with.
             run_env: Options: docker/host/auto. Used in
                 DockerCommandRunner to determine the run environment.
             ssh_options_override_ssh_key: if provided, overwrites
                 SSHOptions class with SSHOptions(ssh_options_override_ssh_key).
             shutdown_after_run: if provided, shutdowns down the machine
-            after executing the command with `sudo shutdown -h now`.
+                after executing the command with `sudo shutdown -h now`.
+
+        Returns:
+            The command output, if `with_output` is True; otherwise an empty
+            string.
         """
         raise NotImplementedError
 
@@ -58,6 +62,7 @@ class CommandRunnerInterface:
         Args:
             source: The (local) source directory or file.
             target: The (remote) destination path.
+            options: Optional rsync options.
         """
         raise NotImplementedError
 
@@ -69,6 +74,7 @@ class CommandRunnerInterface:
         Args:
             source: The (remote) source directory or file.
             target: The (local) destination path.
+            options: Optional rsync options.
         """
         raise NotImplementedError
 

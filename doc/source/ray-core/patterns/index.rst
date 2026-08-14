@@ -1,3 +1,6 @@
+.. meta::
+   :description: Catalog of Ray Core design patterns and anti-patterns for structuring tasks, actors, and object passing.
+
 .. _core-patterns:
 
 Design Patterns & Anti-patterns
@@ -17,6 +20,7 @@ This section is a collection of common design patterns and anti-patterns for wri
     tree-of-actors
     pipelining
     return-ray-put
+    nested-ray-get
     ray-get-loop
     unnecessary-ray-get
     ray-get-submission-order
@@ -26,3 +30,5 @@ This section is a collection of common design patterns and anti-patterns for wri
     pass-large-arg-by-value
     closure-capture-large-objects
     global-variables
+    out-of-band-object-ref-serialization
+    fork-new-processes

@@ -7,19 +7,17 @@ from unittest import mock
 import pytest
 
 from ci.ray_ci.linux_tester_container import LinuxTesterContainer
-from ci.ray_ci.windows_tester_container import WindowsTesterContainer
 from ci.ray_ci.tester import (
     _add_default_except_tags,
-    _get_container,
     _get_all_test_query,
-    _get_test_targets,
-    _get_high_impact_test_targets,
+    _get_container,
     _get_flaky_test_targets,
+    _get_new_tests,
     _get_tag_matcher,
-    _get_changed_files,
-    _get_changed_tests,
-    _get_human_specified_tests,
+    _get_test_targets,
 )
+from ci.ray_ci.windows_tester_container import WindowsTesterContainer
+
 from ray_release.test import Test, TestState
 
 
@@ -45,6 +43,28 @@ def test_get_tag_matcher() -> None:
         bytes(_get_tag_matcher("tag"), "utf-8").decode("unicode_escape"),
         "atagb",
     )
+
+
+def test_linux_privileged() -> None:
+    with mock.patch(
+        "ci.ray_ci.linux_tester_container.LinuxTesterContainer.install_ray",
+        return_value=None,
+    ):
+        container = _get_container(
+            team="core",
+            operating_system="linux",
+            workers=3,
+            worker_id=1,
+            parallelism_per_worker=2,
+            network=None,
+            gpus=0,
+            tmp_filesystem=None,
+            privileged=True,
+        )
+        assert (
+            container.privileged
+            and "--privileged" in container.get_run_command_extra_args()
+        )
 
 
 def test_get_container() -> None:
@@ -82,6 +102,37 @@ def test_get_container() -> None:
         assert isinstance(container, WindowsTesterContainer)
 
 
+def test_get_empty_test_targets() -> None:
+    with mock.patch(
+        "subprocess.check_output",
+        return_value="\n".encode("utf-8"),
+    ), mock.patch(
+        "ci.ray_ci.linux_tester_container.LinuxTesterContainer.install_ray",
+        return_value=None,
+    ), mock.patch(
+        "ray_release.test.Test.gen_from_s3",
+        return_value=set(),
+    ), mock.patch(
+        "ci.ray_ci.tester._get_new_tests",
+        return_value=set(),
+    ), mock.patch(
+        "ray_release.test.Test.gen_microcheck_tests",
+        return_value=set(),
+    ):
+        # Test that the set of test target is empty, rather than a set of empty string
+        assert (
+            set(
+                _get_test_targets(
+                    LinuxTesterContainer("core"),
+                    "targets",
+                    "core",
+                    operating_system="linux",
+                )
+            )
+            == set()
+        )
+
+
 def test_get_test_targets() -> None:
     _TEST_YAML = "flaky_tests: [//python/ray/tests:flaky_test_01]"
 
@@ -95,6 +146,7 @@ def test_get_test_targets() -> None:
             "//python/ray/tests:good_test_02",
             "//python/ray/tests:good_test_03",
             "//python/ray/tests:flaky_test_01",
+            "//python/ray/tests:flaky_test_02",
         ]
         test_objects = [
             _stub_test(
@@ -113,6 +165,14 @@ def test_get_test_targets() -> None:
                     Test.KEY_IS_HIGH_IMPACT: "true",
                 }
             ),
+            _stub_test(
+                {
+                    "name": "linux://python/ray/tests:flaky_test_02",
+                    "team": "core",
+                    "state": TestState.FLAKY,
+                    Test.KEY_IS_HIGH_IMPACT: "true",
+                }
+            ),
         ]
         with mock.patch(
             "subprocess.check_output",
@@ -124,11 +184,11 @@ def test_get_test_targets() -> None:
             "ray_release.test.Test.gen_from_s3",
             return_value=test_objects,
         ), mock.patch(
-            "ray_release.test.Test.gen_high_impact_tests",
-            return_value={"step": test_objects},
-        ), mock.patch(
-            "ci.ray_ci.tester._get_changed_tests",
+            "ci.ray_ci.tester._get_new_tests",
             return_value=set(),
+        ), mock.patch(
+            "ray_release.test.Test.gen_microcheck_tests",
+            return_value={test.get_target() for test in test_objects},
         ):
             assert set(
                 _get_test_targets(
@@ -145,6 +205,23 @@ def test_get_test_targets() -> None:
                 "//python/ray/tests:good_test_03",
             }
 
+            assert set(
+                _get_test_targets(
+                    LinuxTesterContainer("core"),
+                    "targets",
+                    "core",
+                    operating_system="linux",
+                    yaml_dir=tmp,
+                    lookup_test_database=False,
+                )
+            ) == {
+                "//python/ray/tests:high_impact_test_01",
+                "//python/ray/tests:good_test_01",
+                "//python/ray/tests:good_test_02",
+                "//python/ray/tests:good_test_03",
+                "//python/ray/tests:flaky_test_02",
+            }
+
             assert _get_test_targets(
                 LinuxTesterContainer("core"),
                 "targets",
@@ -154,6 +231,7 @@ def test_get_test_targets() -> None:
                 get_flaky_tests=True,
             ) == [
                 "//python/ray/tests:flaky_test_01",
+                "//python/ray/tests:flaky_test_02",
             ]
 
             assert _get_test_targets(
@@ -178,6 +256,7 @@ def test_get_test_targets() -> None:
                 get_high_impact_tests=True,
             ) == [
                 "//python/ray/tests:flaky_test_01",
+                "//python/ray/tests:flaky_test_02",
             ]
 
 
@@ -210,92 +289,17 @@ def test_get_all_test_query() -> None:
     )
 
 
-def test_get_high_impact_test_targets() -> None:
-    test_harness = [
-        {
-            "input": [],
-            "new_tests": set(),
-            "human_tests": set(),
-            "output": set(),
-        },
-        {
-            "input": [
-                _stub_test(
-                    {
-                        "name": "linux://core_good",
-                        "team": "core",
-                    }
-                ),
-                _stub_test(
-                    {
-                        "name": "linux://serve_good",
-                        "team": "serve",
-                    }
-                ),
-            ],
-            "new_tests": {"//core_new"},
-            "human_tests": {"//human_test"},
-            "output": {
-                "//core_good",
-                "//core_new",
-                "//human_test",
-            },
-        },
+@mock.patch("ci.ray_ci.tester_container.TesterContainer.run_script_with_output")
+@mock.patch("ray_release.test.Test.gen_from_s3")
+def test_get_new_tests(mock_gen_from_s3, mock_run_script_with_output) -> None:
+    mock_gen_from_s3.return_value = [
+        _stub_test({"name": "linux://old_test_01"}),
+        _stub_test({"name": "linux://old_test_02"}),
     ]
-    for test in test_harness:
-        with mock.patch(
-            "ray_release.test.Test.gen_high_impact_tests",
-            return_value={"step": test["input"]},
-        ), mock.patch(
-            "ci.ray_ci.tester._get_changed_tests",
-            return_value=test["new_tests"],
-        ), mock.patch(
-            "ci.ray_ci.tester._get_human_specified_tests",
-            return_value=test["human_tests"],
-        ):
-            assert (
-                _get_high_impact_test_targets(
-                    "core",
-                    "linux",
-                    LinuxTesterContainer("test", skip_ray_installation=True),
-                )
-                == test["output"]
-            )
-
-
-@mock.patch.dict(
-    os.environ,
-    {"BUILDKITE_PULL_REQUEST_BASE_BRANCH": "base", "BUILDKITE_COMMIT": "commit"},
-)
-@mock.patch("subprocess.check_call")
-@mock.patch("subprocess.check_output")
-def test_get_changed_files(mock_check_output, mock_check_call) -> None:
-    mock_check_output.return_value = b"file1\nfile2\n"
-    assert _get_changed_files() == {"file1", "file2"}
-
-
-@mock.patch("ci.ray_ci.tester._get_test_targets_per_file")
-@mock.patch("ci.ray_ci.tester._get_changed_files")
-def test_get_changed_tests(
-    mock_get_changed_files, mock_get_test_targets_per_file
-) -> None:
-    mock_get_changed_files.return_value = {"test_src", "build_src"}
-    mock_get_test_targets_per_file.side_effect = (
-        lambda x: {"//t1", "//t2"} if x == "test_src" else {}
-    )
-
-    assert _get_changed_tests() == {"//t1", "//t2"}
-
-
-@mock.patch.dict(
-    os.environ,
-    {"BUILDKITE_PULL_REQUEST_BASE_BRANCH": "base", "BUILDKITE_COMMIT": "commit"},
-)
-@mock.patch("subprocess.check_call")
-@mock.patch("subprocess.check_output")
-def test_get_human_specified_tests(mock_check_output, mock_check_call) -> None:
-    mock_check_output.return_value = b"hi\n@microcheck //test01 //test02\nthere"
-    assert _get_human_specified_tests() == {"//test01", "//test02"}
+    mock_run_script_with_output.return_value = "//old_test_01\n//new_test"
+    assert _get_new_tests(
+        "linux", LinuxTesterContainer("test", skip_ray_installation=True)
+    ) == {"//new_test"}
 
 
 def test_get_flaky_test_targets() -> None:
@@ -401,7 +405,12 @@ def test_get_flaky_test_targets() -> None:
                 f.write(test["input"]["core_test_yaml"])
             for os_name in ["linux", "windows"]:
                 assert (
-                    _get_flaky_test_targets("core", os_name, yaml_dir=tmp)
+                    _get_flaky_test_targets(
+                        "core",
+                        os_name,
+                        yaml_dir=tmp,
+                        lookup_test_database=True,
+                    )
                     == test["output"][os_name]
                 )
 

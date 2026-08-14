@@ -1,3 +1,6 @@
+.. meta::
+   :description: Pattern: use an async actor so its methods run concurrently on one worker, overlapping I/O-bound operations.
+
 Pattern: Using asyncio to run actor methods concurrently
 ========================================================
 
@@ -22,7 +25,7 @@ With the default actor, the code will look like this:
     :start-after: __sync_actor_start__
     :end-before: __sync_actor_end__
 
-This is problematic because ``TaskExecutor.run`` method runs forever and never yield the control to run other methods.
+This is problematic because ``TaskExecutor.run`` method runs forever and never yields control to run other methods.
 We can solve this problem by using :ref:`async actors <async-actors>` and use ``await`` to yield control:
 
 .. literalinclude:: ../doc_code/pattern_async_actor.py
@@ -30,5 +33,4 @@ We can solve this problem by using :ref:`async actors <async-actors>` and use ``
     :start-after: __async_actor_start__
     :end-before: __async_actor_end__
 
-Here, instead of using the blocking :func:`ray.get() <ray.get>` to get the value of an ObjectRef, we use ``await`` so it can yield the control while we are waiting for the object to be fetched.
-
+Here, instead of using the blocking :func:`ray.get() <ray.get>` to get the value of an ObjectRef, we use ``await`` so it can yield control while we are waiting for the object to be fetched.

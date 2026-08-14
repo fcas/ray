@@ -1,23 +1,21 @@
 import logging
-import psutil
 from typing import Any, Dict, Optional
 
 import numpy as np
 
-from ray.rllib.utils import deprecation_warning
+from ray._common.deprecation import DEPRECATED_VALUE, deprecation_warning
+from ray.rllib.policy.sample_batch import MultiAgentBatch, SampleBatch, concat_samples
 from ray.rllib.utils.annotations import OldAPIStack
-from ray.rllib.utils.deprecation import DEPRECATED_VALUE
 from ray.rllib.utils.from_config import from_config
-from ray.rllib.utils.metrics import ALL_MODULES
+from ray.rllib.utils.metrics import ALL_MODULES, TD_ERROR_KEY
 from ray.rllib.utils.metrics.learner_info import LEARNER_STATS_KEY
 from ray.rllib.utils.replay_buffers import (
     EpisodeReplayBuffer,
     MultiAgentPrioritizedReplayBuffer,
+    MultiAgentReplayBuffer,
     PrioritizedEpisodeReplayBuffer,
     ReplayBuffer,
-    MultiAgentReplayBuffer,
 )
-from ray.rllib.policy.sample_batch import concat_samples, MultiAgentBatch, SampleBatch
 from ray.rllib.utils.typing import (
     AlgorithmConfigDict,
     ModuleID,
@@ -28,10 +26,9 @@ from ray.rllib.utils.typing import (
 from ray.util import log_once
 from ray.util.annotations import DeveloperAPI
 
-logger = logging.getLogger(__name__)
+import psutil
 
-# TODO (simon): Move all regular keys to the metric constants file.
-TD_ERROR_KEY = "td_error"
+logger = logging.getLogger(__name__)
 
 
 @DeveloperAPI
@@ -62,12 +59,12 @@ def update_priorities_in_episode_replay_buffer(
                     )
                 continue
             # TODO (simon): Implement multi-agent version. Remove, happens in buffer.
-            assert len(td_error[TD_ERROR_KEY]) == len(
-                replay_buffer._last_sampled_indices
-            )
+            # assert len(td_error[TD_ERROR_KEY]) == len(
+            #     replay_buffer._last_sampled_indices
+            # )
             # TODO (simon): Implement for stateful modules.
 
-            replay_buffer.update_priorities(td_error[TD_ERROR_KEY])
+            replay_buffer.update_priorities(td_error[TD_ERROR_KEY], module_id)
 
 
 @OldAPIStack

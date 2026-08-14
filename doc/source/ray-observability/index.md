@@ -1,3 +1,9 @@
+---
+myst:
+  html_meta:
+    description: "Monitor and debug Ray applications and clusters with logs, metrics, events, dashboards, and the distributed debugger."
+---
+
 (observability)=
 
 # Monitoring and Debugging
@@ -6,6 +12,7 @@
 :hidden:
 
 getting-started
+ray-distributed-debugger
 key-concepts
 User Guides <user-guides/index>
 Reference <reference/index>

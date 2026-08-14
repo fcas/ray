@@ -1,3 +1,6 @@
+.. meta::
+   :description: Anti-pattern: calling ray.get inside a loop blocks on each task in turn and destroys parallelism; collect the refs first.
+
 .. _ray-get-loop:
 
 Anti-pattern: Calling ray.get in a loop harms parallelism
@@ -28,5 +31,7 @@ Instead, we should first schedule all remote calls, which are then processed in 
 
 Other ``ray.get()`` related anti-patterns are:
 
+- :doc:`nested-ray-get`
 - :doc:`unnecessary-ray-get`
 - :doc:`ray-get-submission-order`
+- :doc:`ray-get-too-many-objects`

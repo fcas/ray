@@ -14,32 +14,32 @@
 
 #pragma once
 
-#include <boost/asio.hpp>
-#include <boost/asio/error.hpp>
-#include <boost/bind/bind.hpp>
-#include <map>
+#include <memory>
+#include <optional>
+#include <set>
+#include <string>
+#include <unordered_set>
+#include <utility>
+#include <vector>
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/time/clock.h"
 #include "ray/common/id.h"
-#include "ray/common/ray_config.h"
 #include "ray/common/ray_object.h"
-#include "ray/common/status.h"
 #include "ray/object_manager/common.h"
-#include "ray/object_manager/object_directory.h"
-#include "ray/object_manager/ownership_based_object_directory.h"
-#include "ray/rpc/object_manager/object_manager_client.h"
-#include "ray/rpc/object_manager/object_manager_server.h"
+#include "ray/object_manager/metrics.h"
+#include "ray/util/container_util.h"
 #include "ray/util/counter_map.h"
+#include "ray/util/time.h"
 
 namespace ray {
 
 // Identifier for task metrics reporting, which is tuple of the task name
 // (empty string if unknown), and is_retry bool.
-typedef std::pair<std::string, bool> TaskMetricsKey;
+using TaskMetricsKey = std::pair<std::string, bool>;
 
-enum BundlePriority {
+enum BundlePriority : uint8_t {
   /// Bundle requested by ray.get().
   GET_REQUEST,
   /// Bundle requested by ray.wait().
@@ -65,13 +65,14 @@ class PullManager {
   /// \param restore_spilled_object A callback which should
   /// retrieve an spilled object from the external store.
   PullManager(
-      NodeID &self_node_id,
-      const std::function<bool(const ObjectID &)> object_is_local,
-      const std::function<void(const ObjectID &, const NodeID &)> send_pull_request,
-      const std::function<void(const ObjectID &)> cancel_pull_request,
-      const std::function<void(const ObjectID &, rpc::ErrorType)> fail_pull_request,
-      const RestoreSpilledObjectCallback restore_spilled_object,
-      const std::function<double()> get_time_seconds,
+      NodeID self_node_id,
+      std::function<bool(const ObjectID &)> object_is_local,
+      std::function<void(const std::vector<ObjectID> &, const NodeID &)>
+          send_pull_request,
+      std::function<void(const ObjectID &)> cancel_pull_request,
+      std::function<void(const ObjectID &, rpc::ErrorType)> fail_pull_request,
+      RestoreSpilledObjectCallback restore_spilled_object,
+      std::function<double()> get_time_seconds,
       int pull_timeout_ms,
       int64_t num_bytes_available,
       std::function<std::unique_ptr<RayObject>(const ObjectID &object_id)> pin_object,
@@ -181,12 +182,8 @@ class PullManager {
  private:
   /// A helper structure for tracking information about each ongoing object pull.
   struct ObjectPullRequest {
-    ObjectPullRequest(double first_retry_time)
-        : client_locations(),
-          spilled_url(),
-          next_pull_time(first_retry_time),
-          num_retries(0),
-          bundle_request_ids() {}
+    explicit ObjectPullRequest(double first_retry_time)
+        : next_pull_time(first_retry_time) {}
     std::vector<NodeID> client_locations;
     std::string spilled_url;
     NodeID spilled_node_id;
@@ -196,8 +193,8 @@ class PullManager {
     // the object.
     double expiration_time_seconds = 0;
     int64_t activate_time_ms = 0;
-    int64_t request_start_time_ms = absl::GetCurrentTimeNanos() / 1e3;
-    uint8_t num_retries;
+    int64_t request_start_time_ms = current_time_ns() / 1e3;
+    uint8_t num_retries = 0;
     bool object_size_set = false;
     size_t object_size = 0;
     // All bundle requests that haven't been canceled yet that require this
@@ -226,27 +223,26 @@ class PullManager {
 
   /// A helper structure for tracking information about each ongoing bundle pull request.
   struct BundlePullRequest {
-    BundlePullRequest(std::vector<ObjectID> requested_objects,
-                      const TaskMetricsKey &task_key)
-        : objects(std::move(requested_objects)), task_key(task_key) {}
+    BundlePullRequest(std::vector<ObjectID> requested_objects, TaskMetricsKey task_key)
+        : objects_(std::move(requested_objects)), task_key_(std::move(task_key)) {}
     // All the objects that this bundle is trying to pull.
-    const std::vector<ObjectID> objects;
+    std::vector<ObjectID> objects_;
     // All the objects that are pullable.
-    absl::flat_hash_set<ObjectID> pullable_objects;
+    absl::flat_hash_set<ObjectID> pullable_objects_;
     // The name of the task, if a task arg request, otherwise the empty string.
-    const TaskMetricsKey task_key;
+    TaskMetricsKey task_key_;
 
     void MarkObjectAsPullable(const ObjectID &object) {
-      pullable_objects.emplace(object);
+      pullable_objects_.emplace(object);
     }
 
     void MarkObjectAsUnpullable(const ObjectID &object) {
-      pullable_objects.erase(object);
+      pullable_objects_.erase(object);
     }
 
     // A bundle is pullable if we know the sizes of all objects
     // and none of them is pending creation due to object reconstruction.
-    bool IsPullable() const { return pullable_objects.size() == objects.size(); }
+    bool IsPullable() const { return pullable_objects_.size() == objects_.size(); }
   };
 
   /// A helper structure for tracking all the bundle pull requests for a particular bundle
@@ -289,7 +285,7 @@ class PullManager {
       requests.emplace(request_id, request);
       if (request.IsPullable()) {
         inactive_requests.emplace(request_id);
-        inactive_by_name.Increment(request.task_key);
+        inactive_by_name.Increment(request.task_key_);
         RAY_CHECK_EQ(inactive_requests.size(), inactive_by_name.Total());
       }
     }
@@ -297,7 +293,7 @@ class PullManager {
     void ActivateBundlePullRequest(uint64_t request_id) {
       RAY_CHECK_EQ(inactive_requests.erase(request_id), 1u);
       active_requests.emplace(request_id);
-      auto task_key = map_find_or_die(requests, request_id).task_key;
+      auto task_key = map_find_or_die(requests, request_id).task_key_;
       inactive_by_name.Decrement(task_key);
       RAY_CHECK_EQ(inactive_requests.size(), inactive_by_name.Total());
     }
@@ -305,7 +301,7 @@ class PullManager {
     void DeactivateBundlePullRequest(uint64_t request_id) {
       RAY_CHECK_EQ(active_requests.erase(request_id), 1u);
       inactive_requests.emplace(request_id);
-      auto task_key = map_find_or_die(requests, request_id).task_key;
+      auto task_key = map_find_or_die(requests, request_id).task_key_;
       inactive_by_name.Increment(task_key);
       RAY_CHECK_EQ(inactive_requests.size(), inactive_by_name.Total());
     }
@@ -314,7 +310,7 @@ class PullManager {
       RAY_CHECK(map_find_or_die(requests, request_id).IsPullable());
       RAY_CHECK_EQ(active_requests.count(request_id), 0u);
       inactive_requests.emplace(request_id);
-      auto task_key = map_find_or_die(requests, request_id).task_key;
+      auto task_key = map_find_or_die(requests, request_id).task_key_;
       inactive_by_name.Increment(task_key);
       RAY_CHECK_EQ(inactive_requests.size(), inactive_by_name.Total());
     }
@@ -327,14 +323,14 @@ class PullManager {
       auto it = inactive_requests.find(request_id);
       if (it != inactive_requests.end()) {
         inactive_requests.erase(it);
-        auto task_key = map_find_or_die(requests, request_id).task_key;
+        auto task_key = map_find_or_die(requests, request_id).task_key_;
         inactive_by_name.Decrement(task_key);
         RAY_CHECK_EQ(inactive_requests.size(), inactive_by_name.Total());
       }
     }
 
     void RemoveBundlePullRequest(uint64_t request_id) {
-      auto task_key = map_find_or_die(requests, request_id).task_key;
+      auto task_key = map_find_or_die(requests, request_id).task_key_;
       requests.erase(request_id);
       if (active_requests.find(request_id) != active_requests.end()) {
         active_requests.erase(request_id);
@@ -358,12 +354,28 @@ class PullManager {
     }
   };
 
-  /// Try to make an object local, by restoring the object from external
-  /// storage or by fetching the object from one of its expected client
-  /// locations. This does nothing if the object is not needed by any pull
-  /// request or if it is already local. This also sets a timeout for when to
-  /// make the next attempt to make the object local.
-  void TryToMakeObjectLocal(const ObjectID &object_id)
+  /**
+   * Try to make each object local, by restoring it from external storage or
+   * by fetching it from one of its expected client locations. Objects bound
+   * for the same remote node are coalesced into a single Pull RPC per node.
+   * Objects that are already local, no longer needed, or still inside their
+   * retry-timer window are skipped. May also set a fetch-timeout deadline.
+   *
+   * \param object_ids The objects to attempt to make local.
+   */
+  void TryToMakeObjectsLocal(const std::vector<ObjectID> &object_ids)
+      ABSL_EXCLUSIVE_LOCKS_REQUIRED(active_objects_mu_);
+
+  /**
+   * Fallback path for an object that has no known remote location. Either
+   * restores the object from a local spilled URL, or counts toward the
+   * fetch-timeout deadline (and fails the pull once the deadline elapses).
+   *
+   * \param object_id The object whose source we are looking for.
+   * \param request Mutable per-object pull state used for retry / timeout
+   *     bookkeeping.
+   */
+  void RestoreFromLocalOrTimeout(const ObjectID &object_id, ObjectPullRequest &request)
       ABSL_EXCLUSIVE_LOCKS_REQUIRED(active_objects_mu_);
 
   /// Returns whether the set of active pull requests exceeds the memory allowance
@@ -377,12 +389,16 @@ class PullManager {
   /// Unpin the given object if pinned.
   void UnpinObject(const ObjectID &object_id);
 
-  /// Try to Pull an object from one of its expected client locations. If there
-  /// are more client locations to try after this attempt, then this method
-  /// will try each of the other clients in succession.
-  ///
-  /// \return True if a pull request was sent, otherwise false.
-  bool PullFromRandomLocation(const ObjectID &object_id);
+  /**
+   * Pick a remote node uniformly at random from the known in-memory
+   * locations of the object, or fall back to the spilled-node location if
+   * no in-memory location is known. Does not send an RPC.
+   *
+   * \param object_id Identifier of the object whose remote source will be
+   *     selected.
+   * \return The chosen node, or nullopt if no remote location is known.
+   */
+  std::optional<NodeID> PickRandomPullLocation(const ObjectID &object_id);
 
   /// Update the request retry time for the given request.
   /// The retry timer is incremented exponentially, capped at 1024 * 10 seconds.
@@ -436,7 +452,8 @@ class PullManager {
   /// See the constructor's arguments.
   NodeID self_node_id_;
   const std::function<bool(const ObjectID &)> object_is_local_;
-  const std::function<void(const ObjectID &, const NodeID &)> send_pull_request_;
+  const std::function<void(const std::vector<ObjectID> &, const NodeID &)>
+      send_pull_request_;
   const std::function<void(const ObjectID &)> cancel_pull_request_;
   const RestoreSpilledObjectCallback restore_spilled_object_;
   const std::function<double()> get_time_seconds_;
@@ -519,6 +536,21 @@ class PullManager {
   int64_t num_retries_total_ = 0;
   int64_t num_succeeded_pins_total_ = 0;
   int64_t num_failed_pins_total_ = 0;
+
+  mutable ray::stats::Gauge pull_manager_usage_bytes_gauge_{
+      GetPullManagerUsageBytesGaugeMetric()};
+  mutable ray::stats::Gauge pull_manager_requested_bundles_gauge_{
+      GetPullManagerRequestedBundlesGaugeMetric()};
+  mutable ray::stats::Gauge pull_manager_requests_gauge_{
+      GetPullManagerRequestsGaugeMetric()};
+  mutable ray::stats::Gauge pull_manager_active_bundles_gauge_{
+      GetPullManagerActiveBundlesGaugeMetric()};
+  mutable ray::stats::Gauge pull_manager_retries_total_gauge_{
+      GetPullManagerRetriesTotalGaugeMetric()};
+  mutable ray::stats::Gauge pull_manager_num_object_pins_gauge_{
+      GetPullManagerNumObjectPinsGaugeMetric()};
+  mutable ray::stats::Histogram pull_manager_object_request_time_ms_histogram_{
+      GetPullManagerObjectRequestTimeMsHistogramMetric()};
 
   friend class PullManagerTest;
   friend class PullManagerTestWithCapacity;

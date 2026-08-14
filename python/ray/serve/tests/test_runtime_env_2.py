@@ -2,7 +2,7 @@ import sys
 
 import pytest
 
-from ray._private.test_utils import run_string_as_driver
+from ray._common.test_utils import run_string_as_driver
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Fail to create temp dir.")
@@ -18,11 +18,12 @@ job_config = ray.job_config.JobConfig(runtime_env={"working_dir": "."})
 ray.init(address="auto", namespace="serve", job_config=job_config)
 
 
-@serve.deployment(version="1")
+@serve.deployment
 class Test:
     def __call__(self, *args):
         return open("hello").read()
 
+Test = Test.options(_internal=True, version="1")
 handle = serve.run(Test.bind())
 assert handle.remote().result() == "world"
 """
@@ -41,11 +42,12 @@ job_config = ray.job_config.JobConfig(runtime_env={"working_dir": "."})
 ray.init(address="auto", namespace="serve", job_config=job_config)
 
 
-@serve.deployment(version="2")
+@serve.deployment
 class Test:
     def __call__(self, *args):
         return open("hello").read()
 
+Test = Test.options(_internal=True, version="2")
 handle = serve.run(Test.bind())
 assert handle.remote().result() == "world2"
 serve.delete(SERVE_DEFAULT_APP_NAME)
@@ -61,24 +63,24 @@ def test_pip_no_working_dir(ray_start):
     driver = """
 import ray
 from ray import serve
-import requests
+import httpx
 
 ray.init(address="auto")
 
 
 @serve.deployment
-def requests_version(request):
-    return requests.__version__
+def httpx_version(request):
+    return httpx.__version__
 
 
-serve.run(requests_version.options(
+serve.run(httpx_version.options(
     ray_actor_options={
         "runtime_env": {
-            "pip": ["requests==2.25.1"]
+            "pip": ["httpx==0.25.1"]
         }
     }).bind())
 
-assert requests.get("http://127.0.0.1:8000/requests_version").text == "2.25.1"
+assert httpx.get("http://127.0.0.1:8000/httpx_version").text == "0.25.1"
 """
 
     output = run_string_as_driver(driver)

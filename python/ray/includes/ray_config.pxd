@@ -19,17 +19,9 @@ cdef extern from "ray/common/ray_config.h" nogil:
 
         int64_t object_timeout_milliseconds() const
 
-        int64_t get_timeout_milliseconds() const
-
-        int64_t worker_get_request_size() const
-
-        int64_t worker_fetch_request_size() const
-
         int64_t raylet_client_num_connect_attempts() const
 
         int64_t raylet_client_connect_timeout_milliseconds() const
-
-        int64_t raylet_fetch_timeout_milliseconds() const
 
         int64_t kill_worker_timeout_milliseconds() const
 
@@ -42,8 +34,6 @@ cdef extern from "ray/common/ray_config.h" nogil:
         int object_manager_pull_timeout_ms() const
 
         int object_manager_push_timeout_ms() const
-
-        uint64_t object_manager_default_chunk_size() const
 
         uint32_t maximum_gcs_deletion_batch_size() const
 
@@ -77,12 +67,6 @@ cdef extern from "ray/common/ray_config.h" nogil:
 
         int64_t health_check_failure_threshold() const
 
-        uint64_t memory_monitor_refresh_ms() const
-
-        int64_t grpc_keepalive_time_ms() const
-
-        int64_t grpc_keepalive_timeout_ms() const
-
         int64_t grpc_client_keepalive_time_ms() const
 
         int64_t grpc_client_keepalive_timeout_ms() const
@@ -97,4 +81,23 @@ cdef extern from "ray/common/ray_config.h" nogil:
 
         int64_t py_gcs_connect_timeout_s() const
 
-        int gcs_rpc_server_reconnect_timeout_s() const
+        int maximum_gcs_destroyed_actor_cached_count() const
+
+        c_bool record_task_actor_creation_sites() const
+
+        c_bool start_python_gc_manager_thread() const
+
+        c_bool enable_task_events_to_dashboard_head() const
+
+        # TODO: Deprecate this once task events are fully moved out of GCS.
+        int64_t task_events_max_num_task_in_gcs() const
+
+        int64_t task_events_max_num_profile_events_per_task() const
+
+        int64_t task_events_max_dropped_task_attempts_tracked_per_job_in_gcs() const
+
+        int64_t task_events_gc_job_summary_interval_ms() const
+
+        uint64_t gcs_mark_task_failed_on_worker_dead_delay_ms() const
+
+        uint64_t gcs_mark_task_failed_on_job_done_delay_ms() const

@@ -24,18 +24,6 @@ cdef class Config:
                 .object_timeout_milliseconds())
 
     @staticmethod
-    def get_timeout_milliseconds():
-        return RayConfig.instance().get_timeout_milliseconds()
-
-    @staticmethod
-    def worker_get_request_size():
-        return RayConfig.instance().worker_get_request_size()
-
-    @staticmethod
-    def worker_fetch_request_size():
-        return RayConfig.instance().worker_fetch_request_size()
-
-    @staticmethod
     def raylet_client_num_connect_attempts():
         return RayConfig.instance().raylet_client_num_connect_attempts()
 
@@ -43,11 +31,6 @@ cdef class Config:
     def raylet_client_connect_timeout_milliseconds():
         return (RayConfig.instance()
                 .raylet_client_connect_timeout_milliseconds())
-
-    @staticmethod
-    def raylet_fetch_timeout_milliseconds():
-        return (RayConfig.instance()
-                .raylet_fetch_timeout_milliseconds())
 
     @staticmethod
     def kill_worker_timeout_milliseconds():
@@ -72,10 +55,6 @@ cdef class Config:
     @staticmethod
     def object_manager_push_timeout_ms():
         return RayConfig.instance().object_manager_push_timeout_ms()
-
-    @staticmethod
-    def object_manager_default_chunk_size():
-        return RayConfig.instance().object_manager_default_chunk_size()
 
     @staticmethod
     def maximum_gcs_deletion_batch_size():
@@ -134,18 +113,6 @@ cdef class Config:
         return RayConfig.instance().health_check_failure_threshold()
 
     @staticmethod
-    def memory_monitor_refresh_ms():
-        return (RayConfig.instance().memory_monitor_refresh_ms())
-
-    @staticmethod
-    def grpc_keepalive_time_ms():
-        return RayConfig.instance().grpc_keepalive_time_ms()
-
-    @staticmethod
-    def grpc_keepalive_timeout_ms():
-        return RayConfig.instance().grpc_keepalive_timeout_ms()
-
-    @staticmethod
     def grpc_client_keepalive_time_ms():
         return RayConfig.instance().grpc_client_keepalive_time_ms()
 
@@ -166,5 +133,38 @@ cdef class Config:
         return RayConfig.instance().py_gcs_connect_timeout_s()
 
     @staticmethod
-    def gcs_rpc_server_reconnect_timeout_s():
-        return RayConfig.instance().gcs_rpc_server_reconnect_timeout_s()
+    def maximum_gcs_destroyed_actor_cached_count():
+        return RayConfig.instance().maximum_gcs_destroyed_actor_cached_count()
+
+    @staticmethod
+    def start_python_gc_manager_thread():
+        return RayConfig.instance().start_python_gc_manager_thread()
+
+    @staticmethod
+    def enable_task_events_to_dashboard_head():
+        return RayConfig.instance().enable_task_events_to_dashboard_head()
+
+    @staticmethod
+    def task_events_max_num_task_in_gcs():
+        return RayConfig.instance().task_events_max_num_task_in_gcs()
+
+    @staticmethod
+    def task_events_max_num_profile_events_per_task():
+        return RayConfig.instance().task_events_max_num_profile_events_per_task()
+
+    @staticmethod
+    def task_events_max_dropped_task_attempts_tracked_per_job_in_gcs():
+        return (RayConfig.instance()
+                .task_events_max_dropped_task_attempts_tracked_per_job_in_gcs())
+
+    @staticmethod
+    def task_events_gc_job_summary_interval_ms():
+        return RayConfig.instance().task_events_gc_job_summary_interval_ms()
+
+    @staticmethod
+    def gcs_mark_task_failed_on_worker_dead_delay_ms():
+        return RayConfig.instance().gcs_mark_task_failed_on_worker_dead_delay_ms()
+
+    @staticmethod
+    def gcs_mark_task_failed_on_job_done_delay_ms():
+        return RayConfig.instance().gcs_mark_task_failed_on_job_done_delay_ms()

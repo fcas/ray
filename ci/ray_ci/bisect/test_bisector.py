@@ -1,10 +1,12 @@
 import sys
-import pytest
 from unittest import mock
 
+import pytest
+
 from ci.ray_ci.bisect.bisector import Bisector
-from ci.ray_ci.bisect.validator import Validator
 from ci.ray_ci.bisect.macos_validator import MacOSValidator
+from ci.ray_ci.bisect.validator import Validator
+
 from ray_release.test import Test
 
 
@@ -25,11 +27,14 @@ def test_run(mock_get_revision_lists, mock_checkout_and_validate):
     mock_checkout_and_validate.side_effect = _mock_checkout_and_validate
     mock_get_revision_lists.return_value = ["1", "2", "3", "4", "5"]
 
-    # Test case 1: P P P F F
-    assert Bisector(Test(), "1", "5", MacOSValidator(), "dir").run() == "3"
+    # Test case 1: T T T F F
+    assert Bisector(Test(), "1", "5", MacOSValidator(), "dir").run() == "4"
 
-    # Test case 2: P F
-    assert Bisector(Test(), "3", "4", MacOSValidator(), "dir").run() == "3"
+    # Test case 2: T F
+    assert Bisector(Test(), "3", "4", MacOSValidator(), "dir").run() == "4"
+
+    # Test case 3: T F F
+    assert Bisector(Test(), "3", "5", MacOSValidator(), "dir").run() == "4"
 
 
 @mock.patch("subprocess.check_call")

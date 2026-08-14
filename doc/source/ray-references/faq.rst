@@ -1,5 +1,8 @@
 :orphan:
 
+.. meta::
+   :description: Index of Ray frequently asked questions, linking the Ray Tune FAQ and where to raise further questions or issues.
+
 FAQ
 ==============
 
@@ -11,6 +14,6 @@ FAQ
 
 
 Further Questions or Issues?
-----------------------------
+-----------------------------
 
 .. include:: /_includes/_help.rst

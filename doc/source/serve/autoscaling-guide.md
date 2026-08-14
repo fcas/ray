@@ -1,3 +1,9 @@
+---
+myst:
+  html_meta:
+    description: "Configure Ray Serve autoscaling with num_replicas=auto or autoscaling_config: tune target_ongoing_requests, min_replicas, and max_replicas to match traffic."
+---
+
 (serve-autoscaling)=
 
 # Ray Serve Autoscaling
@@ -40,13 +46,13 @@ Setting `num_replicas="auto"` is equivalent to the following deployment configur
     max_replicas: 100
 ```
 :::{note}
-You can set `num_replicas="auto"` and override its default values (shown above) by specifying `autoscaling_config`, or you can omit `num_replicas="auto"` and fully configure autoscaling yourself.
+When you set `num_replicas="auto"`, Ray Serve applies the defaults shown above, including `max_replicas: 100`. However, if you configure autoscaling manually without using `num_replicas="auto"`, the base default for `max_replicas` is 1, which means autoscaling won't occur unless you explicitly set a higher value. You can override any of these defaults by specifying `autoscaling_config` even when using `num_replicas="auto"`.
 :::
 
 Let's dive into what each of these parameters do.
 
-* **target_ongoing_requests** (replaces the deprecated `target_num_ongoing_requests_per_replica`) is the average number of ongoing requests per replica that the Serve autoscaler tries to ensure. You can adjust it based on your request processing length (the longer the requests, the smaller this number should be) as well as your latency objective (the shorter you want your latency to be, the smaller this number should be).
-* **max_ongoing_requests** (replaces the deprecated `max_concurrent_queries`) is the maximum number of ongoing requests allowed for a replica. Note this parameter is not part of the autoscaling config because it's relevant to all deployments, but it's important to set it relative to the target value if you turn on autoscaling for your deployment.
+* **target_ongoing_requests** is the average number of ongoing requests per replica that the Serve autoscaler tries to ensure. You can adjust it based on your request processing length (the longer the requests, the smaller this number should be) as well as your latency objective (the shorter you want your latency to be, the smaller this number should be).
+* **max_ongoing_requests** is the maximum number of ongoing requests allowed for a replica. Note this parameter is not part of the autoscaling config because it's relevant to all deployments, but it's important to set it relative to the target value if you turn on autoscaling for your deployment.
 * **min_replicas** is the minimum number of replicas for the deployment. Set this to 0 if there are long periods of no traffic and some extra tail latency during upscale is acceptable. Otherwise, set this to what you think you need for low traffic.
 * **max_replicas** is the maximum number of replicas for the deployment. Set this to ~20% higher than what you think you need for peak traffic.
 
@@ -100,8 +106,4 @@ Notice the following:
 
 ## Ray Serve Autoscaler vs Ray Autoscaler
 
-The Ray Serve Autoscaler is an application-level autoscaler that sits on top of the [Ray Autoscaler](cluster-index).
-Concretely, this means that the Ray Serve autoscaler asks Ray to start a number of replica actors based on the request demand.
-If the Ray Autoscaler determines there aren't enough available resources (e.g. CPUs, GPUs, etc.) to place these actors, it responds by requesting more Ray nodes.
-The underlying cloud provider then responds by adding more nodes.
-Similarly, when Ray Serve scales down and terminates replica Actors, it attempts to make as many nodes idle as possible so the Ray Autoscaler can remove them. To learn more about the architecture underlying Ray Serve Autoscaling, see [Ray Serve Autoscaling Architecture](serve-autoscaling-architecture).
+The Ray Serve Autoscaler is an application-level autoscaler that sits on top of the [Ray Autoscaler](cluster-index). Concretely, this means that the Ray Serve autoscaler asks Ray to start a number of replica actors based on the request demand. If the Ray Autoscaler determines there aren't enough available resources (e.g. CPUs, GPUs, etc.) to place these actors, it responds by requesting more Ray nodes. The underlying cloud provider then responds by adding more nodes. Similarly, when Ray Serve scales down and terminates replica Actors, it attempts to make as many nodes idle as possible so the Ray Autoscaler can remove them. To learn more about the architecture underlying Ray Serve Autoscaling, see [Ray Serve Autoscaling Architecture](serve-autoscaling-architecture).

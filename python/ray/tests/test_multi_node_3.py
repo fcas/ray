@@ -4,23 +4,26 @@ import subprocess
 import sys
 from pathlib import Path
 
-import psutil
 import pytest
 
 import ray
 import ray._private.ray_constants as ray_constants
-from ray._private.test_utils import (
+from ray._common.test_utils import (
     Semaphore,
+    run_string_as_driver,
+)
+from ray._private.test_utils import (
     check_call_ray,
     check_call_subprocess,
     kill_process_by_name,
-    start_redis_instance,
-    run_string_as_driver,
     run_string_as_driver_nonblocking,
+    start_redis_instance,
     wait_for_children_of_pid,
     wait_for_children_of_pid_to_exit,
 )
 from ray._private.utils import detect_fate_sharing_support
+
+import psutil
 
 
 def test_calling_start_ray_head(call_ray_stop_only):
@@ -128,7 +131,7 @@ def test_calling_start_ray_head(call_ray_stop_only):
     )
     check_call_ray(["stop"])
 
-    temp_dir = ray._private.utils.get_ray_temp_dir()
+    temp_dir = ray._common.utils.get_default_ray_temp_dir()
 
     # Test starting Ray with RAY_REDIS_ADDRESS env.
     _, proc = start_redis_instance(
@@ -141,7 +144,10 @@ def test_calling_start_ray_head(call_ray_stop_only):
     del os.environ["RAY_REDIS_ADDRESS"]
 
     # Test --block. Killing a child process should cause the command to exit.
-    blocked = subprocess.Popen(["ray", "start", "--head", "--block", "--port", "0"])
+    blocked = subprocess.Popen(
+        ["ray", "start", "--head", "--block", "--port", "0"],
+        env={**os.environ, "RAY_GRACEFUL_SHUTDOWN_DRAIN_TIMEOUT_S": "0"},
+    )
 
     blocked.poll()
     assert blocked.returncode is None
@@ -179,7 +185,10 @@ for i in range(0, 5):
     assert blocked.returncode != 0, "ray start shouldn't return 0 on bad exit"
 
     # Test --block. Killing the command should clean up all child processes.
-    blocked = subprocess.Popen(["ray", "start", "--head", "--block", "--port", "0"])
+    blocked = subprocess.Popen(
+        ["ray", "start", "--head", "--block", "--port", "0"],
+        env={**os.environ, "RAY_GRACEFUL_SHUTDOWN_DRAIN_TIMEOUT_S": "0"},
+    )
     blocked.poll()
     assert blocked.returncode is None
 
@@ -196,6 +205,54 @@ for i in range(0, 5):
     wait_for_children_of_pid_to_exit(blocked.pid, timeout=30)
     blocked.wait()
     assert blocked.returncode != 0, "ray start shouldn't return 0 on bad exit"
+
+
+def test_graceful_shutdown_drains_node_on_sigterm(
+    call_ray_stop_only, monkeypatch, tmp_path
+):
+    # Opt-in graceful drain on SIGTERM (#64181): with
+    # RAY_GRACEFUL_SHUTDOWN_DRAIN_TIMEOUT_S set, SIGTERM to a `ray start --block`
+    # node marks the node draining and waits for it to finish before tearing
+    # down, instead of killing the raylet within ~1s. We assert on the drain log
+    # markers, which only appear when the option is enabled.
+    import signal
+    import time
+
+    monkeypatch.setenv("RAY_GRACEFUL_SHUTDOWN_DRAIN_TIMEOUT_S", "8")
+    monkeypatch.setenv("RAY_GRACEFUL_SHUTDOWN_POLL_INTERVAL_S", "0.5")
+
+    log_path = tmp_path / "ray_start.log"
+    with open(log_path, "w") as out:
+        blocked = subprocess.Popen(
+            ["ray", "start", "--head", "--block", "--include-dashboard", "false"],
+            stdout=out,
+            stderr=subprocess.STDOUT,
+        )
+        try:
+            # Wait for the runtime to come up.
+            deadline = time.time() + 30
+            while time.time() < deadline and blocked.poll() is None:
+                if "Ray runtime started" in log_path.read_text():
+                    break
+                time.sleep(0.5)
+            assert "Ray runtime started" in log_path.read_text(), log_path.read_text()
+
+            # SIGTERM the supervisor, as Kubernetes would to PID 1.
+            blocked.send_signal(signal.SIGTERM)
+            blocked.wait(timeout=30)
+
+            # The node drained before teardown (these markers are absent when the
+            # option is off, which tears the raylet down within ~1s).
+            log = log_path.read_text()
+            assert "received SIGTERM. Draining for up to 8" in log, log[-2000:]
+            assert (
+                "Local node finished draining" in log
+                or "did not finish draining within" in log
+            ), log[-2000:]
+        finally:
+            if blocked.poll() is None:
+                blocked.kill()
+                blocked.wait()
 
 
 def test_ray_start_non_head(call_ray_stop_only, monkeypatch):
@@ -267,168 +324,56 @@ print("success")
     assert "success" in out
 
 
-def test_run_driver_twice(ray_start_regular):
-    # We used to have issue 2165 and 2288:
-    # https://github.com/ray-project/ray/issues/2165
-    # https://github.com/ray-project/ray/issues/2288
-    # both complain that driver will hang when run for the second time.
-    # This test is used to verify the fix for above issue, it will run the
-    # same driver for twice and verify whether both of them succeed.
+def test_custom_serde_cleared_across_drivers(ray_start_regular):
+    """Verify that custom serializers are cleared across driver runs.
+
+    This is a regression test for:
+    - https://github.com/ray-project/ray/issues/2165
+    - https://github.com/ray-project/ray/issues/2288
+    """
+
     address_info = ray_start_regular
     driver_script = """
+from typing import Optional
+
 import ray
-import ray.train
-import ray.tune as tune
-import os
-import time
 
-def train_func(config):
-    for i in range(2):
-        time.sleep(0.1)
-        ray.train.report(dict(timesteps_total=i, mean_accuracy=i+97))  # report metrics
+ray.init(address="{address}", namespace="default_test_namespace")
 
-os.environ["TUNE_RESUME_PROMPT_OFF"] = "True"
-ray.init(address="{}", namespace="default_test_namespace")
-ray.tune.register_trainable("train_func", train_func)
+multiplier: int = int("{multiplier}")
 
-tune.run_experiments({{
-    "my_experiment": {{
-        "run": "train_func",
-        "stop": {{"mean_accuracy": 99}},
-        "config": {{
-            "layer1": {{
-                "class_name": tune.grid_search(["a"]),
-                "config": {{"lr": tune.grid_search([1, 2])}}
-            }},
-        }},
-        "local_dir": os.path.expanduser("~/tmp")
-    }}
-}})
-print("success")
-""".format(
-        address_info["address"]
-    )
+class CustomObject:
+    def __init__(self, val: Optional[int]):
+        self.val: Optional[int] = val
 
-    for i in range(2):
-        out = run_string_as_driver(driver_script)
-        assert "success" in out
+def custom_serializer(o: CustomObject) -> int:
+    return o.val * multiplier
 
+def custom_deserializer(val: int) -> CustomObject:
+    return CustomObject(val)
 
-@pytest.mark.skip(reason="fate sharing not implemented yet")
-def test_driver_exiting_when_worker_blocked(call_ray_start):
-    # This test will create some drivers that submit some tasks and then
-    # exit without waiting for the tasks to complete.
-    address = call_ray_start
+ray.util.register_serializer(
+    CustomObject,
+    serializer=custom_serializer,
+    deserializer=custom_deserializer,
+)
 
-    ray.init(address=address)
-
-    # Define a driver that creates two tasks, one that runs forever and the
-    # other blocked on the first in a `ray.get`.
-    driver_script = """
-import time
-import ray
-ray.init(address="{}")
 @ray.remote
-def f():
-    time.sleep(10**6)
-@ray.remote
-def g():
-    ray.get(f.remote())
-g.remote()
-time.sleep(1)
-print("success")
-""".format(
-        address
-    )
+def f(o: CustomObject) -> int:
+    return o.val
 
-    # Create some drivers and let them exit and make sure everything is
-    # still alive.
-    for _ in range(3):
-        out = run_string_as_driver(driver_script)
-        # Make sure the first driver ran to completion.
-        assert "success" in out
-
-    # Define a driver that creates two tasks, one that runs forever and the
-    # other blocked on the first in a `ray.wait`.
-    driver_script = """
-import time
-import ray
-ray.init(address="{}")
-@ray.remote
-def f():
-    time.sleep(10**6)
-@ray.remote
-def g():
-    ray.wait([f.remote()])
-g.remote()
-time.sleep(1)
-print("success")
-""".format(
-        address
-    )
-
-    # Create some drivers and let them exit and make sure everything is
-    # still alive.
-    for _ in range(3):
-        out = run_string_as_driver(driver_script)
-        # Make sure the first driver ran to completion.
-        assert "success" in out
-
-    # Define a driver that creates one task that depends on a nonexistent
-    # object. This task will be queued as waiting to execute.
-    driver_script_template = """
-import time
-import ray
-ray.init(address="{}")
-@ray.remote
-def g(x):
-    return
-g.remote(ray.ObjectRef(ray._private.utils.hex_to_binary("{}")))
-time.sleep(1)
-print("success")
+print("Value is:", ray.get(f.remote(CustomObject(1))))
 """
 
-    # Create some drivers and let them exit and make sure everything is
-    # still alive.
-    for _ in range(3):
-        nonexistent_id = ray.ObjectRef.from_random()
-        driver_script = driver_script_template.format(address, nonexistent_id.hex())
-        out = run_string_as_driver(driver_script)
-        # Simulate the nonexistent dependency becoming available.
-        ray._private.worker.global_worker.put_object(None, nonexistent_id)
-        # Make sure the first driver ran to completion.
-        assert "success" in out
-
-    # Define a driver that calls `ray.wait` on a nonexistent object.
-    driver_script_template = """
-import time
-import ray
-ray.init(address="{}")
-@ray.remote
-def g():
-    ray.wait(ray.ObjectRef(ray._private.utils.hex_to_binary("{}")))
-g.remote()
-time.sleep(1)
-print("success")
-"""
-
-    # Create some drivers and let them exit and make sure everything is
-    # still alive.
-    for _ in range(3):
-        nonexistent_id = ray.ObjectRef.from_random()
-        driver_script = driver_script_template.format(address, nonexistent_id.hex())
-        out = run_string_as_driver(driver_script)
-        # Simulate the nonexistent dependency becoming available.
-        ray._private.worker.global_worker.put_object(None, nonexistent_id)
-        # Make sure the first driver ran to completion.
-        assert "success" in out
-
-    @ray.remote
-    def f():
-        return 1
-
-    # Make sure we can still talk with the raylet.
-    ray.get(f.remote())
+    assert "Value is: 2" in run_string_as_driver(
+        driver_script.format(address=address_info["address"], multiplier="2")
+    )
+    assert "Value is: 4" in run_string_as_driver(
+        driver_script.format(address=address_info["address"], multiplier="4")
+    )
+    assert "Value is: 8" in run_string_as_driver(
+        driver_script.format(address=address_info["address"], multiplier="8")
+    )
 
 
 def test_multi_driver_logging(ray_start_regular):
@@ -450,7 +395,7 @@ def test_multi_driver_logging(ray_start_regular):
     driver_script_template = """
 import ray
 import sys
-from ray._private.test_utils import Semaphore
+from ray._common.test_utils import Semaphore
 
 @ray.remote(num_cpus=0)
 def remote_print(s, file=None):
@@ -562,12 +507,7 @@ def test_ray_stop_kill_workers():
 
 
 if __name__ == "__main__":
-    import pytest
-
     # Make subprocess happy in bazel.
     os.environ["LC_ALL"] = "en_US.UTF-8"
     os.environ["LANG"] = "en_US.UTF-8"
-    if os.environ.get("PARALLEL_CI"):
-        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
-    else:
-        sys.exit(pytest.main(["-sv", __file__]))
+    sys.exit(pytest.main(["-sv", __file__]))

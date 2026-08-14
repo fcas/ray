@@ -82,7 +82,7 @@ class HyperOptSearch(Searcher):
             for future parameters. Needs to be a list of dicts containing the
             configurations.
         n_initial_points: number of random evaluations of the
-            objective function before starting to aproximate it with
+            objective function before starting to approximate it with
             tree parzen estimators. Defaults to 20.
         random_state_seed: seed for reproducible
             results. Defaults to None.
@@ -518,31 +518,34 @@ class HyperOptSearch(Searcher):
                     return hpo.hp.uniformint(par, domain.lower, high=domain.upper - 1)
             elif isinstance(domain, Categorical):
                 if isinstance(sampler, Uniform):
-                    return hpo.hp.choice(
-                        par,
-                        [
-                            (
+                    seq = []
+                    for i, category in enumerate(domain.categories):
+                        if isinstance(category, dict):
+                            # A dict of plain constants converts to {}, but
+                            # hyperopt accepts constant dicts as choice
+                            # categories, so pass the original through.
+                            choice = HyperOptSearch.convert_search_space(
+                                category, prefix=par
+                            )
+                            if choice:
+                                seq.append(choice)
+                            else:
+                                seq.append(category)
+                        elif (
+                            isinstance(category, list)
+                            and len(category) > 0
+                            and isinstance(category[0], Domain)
+                        ):
+                            seq.append(
                                 HyperOptSearch.convert_search_space(
-                                    category, prefix=par
-                                )
-                                if isinstance(category, dict)
-                                else (
-                                    HyperOptSearch.convert_search_space(
-                                        dict(enumerate(category)), prefix=f"{par}/{i}"
-                                    )
-                                    if isinstance(category, list)
-                                    and len(category) > 0
-                                    and isinstance(category[0], Domain)
-                                    else (
-                                        resolve_value(f"{par}/{i}", category)
-                                        if isinstance(category, Domain)
-                                        else category
-                                    )
+                                    dict(enumerate(category)), prefix=f"{par}/{i}"
                                 )
                             )
-                            for i, category in enumerate(domain.categories)
-                        ],
-                    )
+                        elif isinstance(category, Domain):
+                            seq.append(resolve_value(f"{par}/{i}", category))
+                        else:
+                            seq.append(category)
+                    return hpo.hp.choice(par, seq)
 
             raise ValueError(
                 "HyperOpt does not support parameters of type "

@@ -1,3 +1,6 @@
+.. meta::
+   :description: Ray generators that yield values incrementally from tasks and actor methods, with error handling, asyncio, cancellation, and fault tolerance.
+
 .. _generators:
 
 Ray Generators
@@ -97,7 +100,7 @@ Ray raises the exception.
     :start-after: __streaming_generator_exception_start__
     :end-before: __streaming_generator_exception_end__
 
-In the above example, if the an application fails the task, Ray returns the object reference with an exception
+In the above example, if an application fails the task, Ray returns the object reference with an exception
 in a correct order. For example, if Ray raises the exception after the second yield, the third
 ``next(gen)`` returns an object reference with an exception all the time. If a system error fails the task,
 (e.g., a node failure or worker process failure), ``next(gen)`` returns the object reference that contains the system level exception
@@ -210,3 +213,10 @@ Ray generators don't support these features:
 - ``return`` statements from generators.
 - Passing ``ObjectRefGenerator`` to another task or actor.
 - :ref:`Ray Client <ray-client-ref>`
+
+Deprecated Dynamic Generator
+----------------------------
+.. toctree::
+    :maxdepth: 1
+
+    tasks/dynamic_generators.rst

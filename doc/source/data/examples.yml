@@ -1,6 +1,13 @@
-text: Below are examples for using Ray Data for batch inference workloads with a variety of frameworks and use cases.
+# This file is used to auto-generate the Examples Gallery page.
+# Do not edit the generated examples.rst page directly.
+# To request formatting changes to the generated page, file an issue with the Ray docs team.
+# To reference the generated page, use examples.html.
+# When adding a new example, include the skill level and framework, if applicable.
+
+text: Below are examples for using Ray Data for batch inference workloads or large-scale data processing with a variety of frameworks and use cases.
 columns_to_show:
   - frameworks
+groupby: skill_level
 examples:
   - title: Image Classification Batch Inference with PyTorch ResNet152
     skill_level: beginner
@@ -27,4 +34,46 @@ examples:
     skill_level: beginner
     frameworks:
       - xgboost
-    link: ../train/examples/xgboost/xgboost_example
+    link: ../_collections/ray-overview/examples/e2e-xgboost/README
+  - title: LLM Batch Inference
+    skill_level: beginner
+    frameworks:
+      - vLLM
+    use_cases:
+      - large language models
+      - generative ai
+    link: ../_collections/data/examples/llm_batch_inference_text/README
+  - title: Batch Inference with Structural Output
+    skill_level: beginner
+    frameworks:
+      - vLLM
+    use_cases:
+      - large language models
+      - generative ai
+    link: ../llm/examples/batch/vllm-with-structural-output
+  - title: Batch Inference with LoRA Adapter
+    skill_level: beginner
+    frameworks:
+      - vLLM
+    use_cases:
+      - large language models
+      - generative ai
+    link: ../llm/examples/batch/vllm-with-lora
+  - title: Multimodal LLM Batch Inference
+    skill_level: beginner
+    frameworks:
+      - vLLM
+    use_cases:
+      - large language models
+      - generative ai
+      - computer vision
+    link: ../_collections/data/examples/llm_batch_inference_vision/README
+  - title: Unstructured Data Ingestion and Processing
+    skill_level: intermediate
+    frameworks:
+      - Transformers
+      - Unstructured
+    use_cases:
+      - document processing
+      - data ingestion
+    link: ../_collections/data/examples/unstructured_data_ingestion/README

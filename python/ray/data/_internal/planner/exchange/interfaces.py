@@ -1,12 +1,16 @@
 import logging
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import ray._private.worker
 from ray.data._internal.execution.interfaces import RefBundle
 from ray.data._internal.stats import StatsDict
 from ray.data._internal.util import convert_bytes_to_human_readable_str
-from ray.data.block import Block, BlockMetadata
+from ray.data.block import Block
 from ray.data.context import DataContext
+
+if TYPE_CHECKING:
+
+    from ray.data.block import BlockMetadataWithSchema
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +47,7 @@ class ExchangeTaskSpec:
         idx: int,
         block: Block,
         output_num_blocks: int,
-    ) -> List[Union[BlockMetadata, Block]]:
+    ) -> List[Union[Block, "BlockMetadataWithSchema"]]:
         """
         Map function to be run on each input block.
 
@@ -55,12 +59,12 @@ class ExchangeTaskSpec:
     def reduce(
         *mapper_outputs: List[Block],
         partial_reduce: bool = False,
-    ) -> Tuple[Block, BlockMetadata]:
+    ) -> Tuple[Block, "BlockMetadataWithSchema"]:
         """
         Reduce function to be run for each output block.
 
         Args:
-            mapper_outputs: List of map output blocks to reduce.
+            *mapper_outputs: List of map output blocks to reduce.
             partial_reduce: Whether should partially or fully reduce.
 
         Returns:
@@ -76,7 +80,8 @@ class ExchangeTaskScheduler:
     """
 
     def __init__(self, exchange_spec: ExchangeTaskSpec):
-        """
+        """Initialize the scheduler.
+
         Args:
             exchange_spec: The implementation of exchange tasks to execute.
         """

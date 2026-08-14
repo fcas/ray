@@ -1,8 +1,9 @@
 import subprocess
 from typing import List, Optional
 
-from ci.ray_ci.utils import logger
 from ci.ray_ci.bisect.validator import Validator
+from ci.ray_ci.utils import logger
+
 from ray_release.test import Test
 
 
@@ -38,7 +39,7 @@ class Bisector:
             if self._checkout_and_validate(revisions[mid]):
                 revisions = revisions[mid:]
             else:
-                revisions = revisions[:mid]
+                revisions = revisions[: (mid + 1)]
 
         return revisions[-1]
 
